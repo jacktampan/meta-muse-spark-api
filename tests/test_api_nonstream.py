@@ -37,7 +37,7 @@ class ApiNonStreamingTests(unittest.TestCase):
         self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
         self.assertIn("conversation_id", payload)
 
-    def test_chat_completions_reuses_conversation_id_mapping_across_turns(self):
+    def test_chat_completions_uses_stateful_bootstrap_then_current_user_turn(self):
         seen = []
 
         async def fake_provider(request, state_path=None):
@@ -45,7 +45,7 @@ class ApiNonStreamingTests(unittest.TestCase):
             return MuseProviderResponse(
                 text="ok",
                 conversation_id=request.conversation_id,
-                template_name="chat" if len(seen) > 1 else "home",
+                template_name="chat",
             )
 
         with tempfile.TemporaryDirectory() as tmp:

@@ -100,9 +100,10 @@ API settings from env
 - `MUSE_SPARK_DEBUG_FRAME_DUMPS` default: `0`
 
 Notes
-- The API is stateless for now. Each request creates a fresh Muse conversation under the hood.
-- New conversations use the captured home template.
-- Follow ups and resumed chats in the CLI use the captured chat template.
+- The API is stateful: each OpenAI conversation_id maps to a persistent Meta conversation under the hood.
+- New conversations use a hidden bootstrap turn, then the real user turn.
+- Follow ups reuse the same conversation_id and send only the latest user message.
+- The stateless transcript compiler is removed; stateful XML turn planning is the only chat path.
 - The CLI stores known conversations locally in `~/.muse_spark/state.json`.
 - If auth expires, rerun `auth set` with fresh Charles values.
 - `response_format={"type":"json_object"}` is best-effort prompting, not hard schema enforcement.

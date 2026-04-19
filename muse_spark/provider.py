@@ -24,12 +24,15 @@ from .client import (
 )
 
 
+
 @dataclass
 class MuseProviderRequest:
     prompt: str
     conversation_id: Optional[str] = None
     template_name: str = HOME_TEMPLATE_NAME
     receive_timeout: float = 4.0
+    bootstrap_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None
 
 
 @dataclass
@@ -121,8 +124,22 @@ async def generate_from_state_async(
         mode=auth["mode"],
         user_agent=auth["user_agent"],
     )
+    bootstrap_prompt = request.bootstrap_prompt or ""
+    user_prompt = request.user_prompt or request.prompt
+    if bootstrap_prompt:
+        await generate_fn(
+            prompt=bootstrap_prompt,
+            conversation_id=conversation_id,
+            authorization=auth["authorization"],
+            cookie_header=auth["cookie_header"],
+            mode=auth["mode"],
+            user_agent=auth["user_agent"],
+            switch_mode_first=False,
+            receive_timeout=request.receive_timeout,
+            template_name=HOME_TEMPLATE_NAME,
+        )
     text = await generate_fn(
-        prompt=request.prompt,
+        prompt=user_prompt,
         conversation_id=conversation_id,
         authorization=auth["authorization"],
         cookie_header=auth["cookie_header"],
@@ -166,8 +183,23 @@ async def stream_from_state_async(
         mode=auth["mode"],
         user_agent=auth["user_agent"],
     )
+    bootstrap_prompt = request.bootstrap_prompt or ""
+    user_prompt = request.user_prompt or request.prompt
+    if bootstrap_prompt:
+        async for chunk in stream_fn(
+            prompt=bootstrap_prompt,
+            conversation_id=conversation_id,
+            authorization=auth["authorization"],
+            cookie_header=auth["cookie_header"],
+            mode=auth["mode"],
+            user_agent=auth["user_agent"],
+            switch_mode_first=False,
+            receive_timeout=request.receive_timeout,
+            template_name=HOME_TEMPLATE_NAME,
+        ):
+            _ = chunk
     async for chunk in stream_fn(
-        prompt=request.prompt,
+        prompt=user_prompt,
         conversation_id=conversation_id,
         authorization=auth["authorization"],
         cookie_header=auth["cookie_header"],
