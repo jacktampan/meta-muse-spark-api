@@ -19,6 +19,7 @@ def build_chat_completion_response(
     finish_reason: str = "stop",
     response_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    bootstrap_response: Optional[str] = None,
 ) -> dict[str, Any]:
     payload = {
         "id": response_id or f"chatcmpl-{uuid.uuid4()}",
@@ -35,6 +36,8 @@ def build_chat_completion_response(
     }
     if conversation_id is not None:
         payload["conversation_id"] = conversation_id
+    if bootstrap_response is not None:
+        payload["bootstrap_response"] = bootstrap_response
     return payload
 
 
@@ -47,6 +50,7 @@ def build_chat_completion_chunk(
     finish_reason: Optional[str] = None,
     index: int = 0,
     conversation_id: Optional[str] = None,
+    bootstrap_response: Optional[str] = None,
 ) -> dict[str, Any]:
     payload = {
         "id": response_id,
@@ -63,6 +67,8 @@ def build_chat_completion_chunk(
     }
     if conversation_id is not None:
         payload["conversation_id"] = conversation_id
+    if bootstrap_response is not None:
+        payload["bootstrap_response"] = bootstrap_response
     return payload
 
 

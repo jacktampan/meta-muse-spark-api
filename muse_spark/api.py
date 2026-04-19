@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Union
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .client import DEFAULT_STATE_PATH
+from .client import CHAT_TEMPLATE_NAME, DEFAULT_STATE_PATH, HOME_TEMPLATE_NAME
 from .config import ApiSettings
 from .errors import MissingAuthError, ProviderProtocolError, ProviderTransportError, ReauthRequiredError
 from .logging_utils import get_logger
@@ -19,7 +19,7 @@ from .openai_compat import (
     encode_sse_data,
     encode_sse_done,
 )
-from .prompt_compiler import compile_chat_messages
+from .prompt_compiler import build_stateful_turn_plan
 from .provider import (
     MuseProviderRequest,
     generate_from_state_async,
@@ -70,6 +70,7 @@ async def _stream_chat_completion(
     response_id: str,
     conversation_id: str,
     chunk_size: int,
+    bootstrap_response: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
     yield encode_sse_data(
         build_chat_completion_chunk(
@@ -77,6 +78,7 @@ async def _stream_chat_completion(
             response_id=response_id,
             delta={"role": "assistant"},
             conversation_id=conversation_id,
+            bootstrap_response=bootstrap_response,
         )
     )
     async for provider_chunk in chunk_iter:
@@ -88,6 +90,7 @@ async def _stream_chat_completion(
                         response_id=response_id,
                         delta={"content": chunk},
                         conversation_id=conversation_id,
+                        bootstrap_response=bootstrap_response,
                     )
                 )
     yield encode_sse_data(
@@ -97,6 +100,7 @@ async def _stream_chat_completion(
             delta={},
             finish_reason="stop",
             conversation_id=conversation_id,
+            bootstrap_response=bootstrap_response,
         )
     )
     yield encode_sse_done()
@@ -107,7 +111,7 @@ def create_app(
     *,
     provider_generate_fn: ProviderGenerateFn = generate_from_state_async,
     provider_stream_fn: ProviderStreamFn = stream_from_state_async,
-    compiler_fn: CompilerFn = compile_chat_messages,
+    compiler_fn: CompilerFn = build_stateful_turn_plan,
     load_auth_fn: LoadAuthFn = load_provider_auth,
     state_path: Union[Path, str] = DEFAULT_STATE_PATH,
     settings: Optional[ApiSettings] = None,
@@ -167,18 +171,26 @@ def create_app(
         if body.model != settings.model_name:
             return error_json(400, "invalid_model", f"Unsupported model: {body.model}")
 
-        compiled = compiler_fn(
-            [message.model_dump() for message in body.messages],
-            response_format=body.response_format.model_dump() if body.response_format else None,
-            max_tokens=body.max_tokens,
-            stop=_normalize_stop(body.stop),
-        )
+        compiled = compiler_fn([message.model_dump() for message in body.messages])
         resolved = resolve_api_conversation(state_path=state_path, client_conversation_id=body.conversation_id)
         provider_request = MuseProviderRequest(
-            prompt=compiled.prompt,
+            prompt=compiled.user_prompt,
             conversation_id=resolved.meta_conversation_id,
-            template_name=resolved.template_name,
+            template_name=CHAT_TEMPLATE_NAME,
+            user_prompt=compiled.user_prompt,
         )
+        bootstrap_response_text: Optional[str] = None
+        if not body.conversation_id and compiled.bootstrap_prompt:
+            bootstrap_response = await provider_generate_fn(
+                MuseProviderRequest(
+                    prompt=compiled.bootstrap_prompt,
+                    conversation_id=resolved.meta_conversation_id,
+                    template_name=HOME_TEMPLATE_NAME,
+                ),
+                state_path=state_path,
+            )
+            if body.include_bootstrap_response:
+                bootstrap_response_text = bootstrap_response.text
 
         if body.stream:
             response_id = f"chatcmpl-{uuid.uuid4()}"
@@ -190,6 +202,7 @@ def create_app(
                     response_id=response_id,
                     conversation_id=resolved.client_conversation_id,
                     chunk_size=settings.stream_chunk_size,
+                    bootstrap_response=bootstrap_response_text,
                 ),
                 media_type="text/event-stream",
             )
@@ -199,6 +212,7 @@ def create_app(
             content=provider_response.text,
             model=settings.model_name,
             conversation_id=resolved.client_conversation_id,
+            bootstrap_response=bootstrap_response_text,
         )
 
     return app

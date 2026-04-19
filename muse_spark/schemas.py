@@ -28,5 +28,6 @@ class ChatCompletionsRequest(BaseModel):
     max_tokens: Optional[int] = None
     stop: Optional[Union[str, list[str]]] = None
     response_format: Optional[ResponseFormat] = None
+    include_bootstrap_response: bool = False
     user: Optional[str] = None
     temperature: Optional[float] = None
