@@ -70,6 +70,7 @@ async def _stream_chat_completion(
     response_id: str,
     conversation_id: str,
     chunk_size: int,
+    logger: Any,
     bootstrap_response: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
     yield encode_sse_data(
@@ -81,18 +82,23 @@ async def _stream_chat_completion(
             bootstrap_response=bootstrap_response,
         )
     )
-    async for provider_chunk in chunk_iter:
-        for chunk in _chunk_text(provider_chunk, chunk_size):
-            if chunk:
-                yield encode_sse_data(
-                    build_chat_completion_chunk(
-                        model=model,
-                        response_id=response_id,
-                        delta={"content": chunk},
-                        conversation_id=conversation_id,
-                        bootstrap_response=bootstrap_response,
+    try:
+        async for provider_chunk in chunk_iter:
+            for chunk in _chunk_text(provider_chunk, chunk_size):
+                if chunk:
+                    yield encode_sse_data(
+                        build_chat_completion_chunk(
+                            model=model,
+                            response_id=response_id,
+                            delta={"content": chunk},
+                            conversation_id=conversation_id,
+                            bootstrap_response=bootstrap_response,
+                        )
                     )
-                )
+    except Exception:
+        logger.exception("streaming_failed")
+        return
+
     yield encode_sse_data(
         build_chat_completion_chunk(
             model=model,
@@ -202,6 +208,7 @@ def create_app(
                     response_id=response_id,
                     conversation_id=resolved.client_conversation_id,
                     chunk_size=settings.stream_chunk_size,
+                    logger=logger,
                     bootstrap_response=bootstrap_response_text,
                 ),
                 media_type="text/event-stream",
