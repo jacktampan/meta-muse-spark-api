@@ -70,10 +70,14 @@ def resolve_api_conversation(
     state_path: Union[Path, str] = DEFAULT_STATE_PATH,
     client_conversation_id: Optional[str] = None,
     meta_conversation_id_factory: ConversationIdFactory = lambda: str(uuid.uuid4()),
+    force_single_conversation: bool = False,
 ) -> ResolvedConversation:
     state = load_state(state_path)
     mappings = state.setdefault(API_CONVERSATIONS_KEY, {})
     now = int(time.time())
+
+    if force_single_conversation and not client_conversation_id:
+        client_conversation_id = "default-single-conversation"
 
     if client_conversation_id and client_conversation_id in mappings:
         mapping = mappings[client_conversation_id]

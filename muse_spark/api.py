@@ -178,12 +178,17 @@ def create_app(
             return error_json(400, "invalid_model", f"Unsupported model: {body.model}")
 
         compiled = compiler_fn([message.model_dump() for message in body.messages])
-        resolved = resolve_api_conversation(state_path=state_path, client_conversation_id=body.conversation_id)
+        resolved = resolve_api_conversation(
+            state_path=state_path,
+            client_conversation_id=body.conversation_id,
+            force_single_conversation=settings.force_single_conversation,
+        )
         provider_request = MuseProviderRequest(
             prompt=compiled.user_prompt,
             conversation_id=resolved.meta_conversation_id,
             template_name=CHAT_TEMPLATE_NAME,
             user_prompt=compiled.user_prompt,
+            receive_timeout=settings.receive_timeout,
         )
         bootstrap_response_text: Optional[str] = None
         if not body.conversation_id and compiled.bootstrap_prompt:

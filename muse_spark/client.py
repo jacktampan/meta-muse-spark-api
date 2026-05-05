@@ -600,12 +600,26 @@ async def stream_text_deltas(
                     full_text = _event_full_text(event)
                     if not isinstance(full_text, str) or full_text == current_text:
                         continue
+                    # Ensure we only yield if it's longer than what we have,
+                    # and try to only yield the new suffix.
                     if full_text.startswith(current_text):
                         delta = full_text[len(current_text) :]
+                    elif len(full_text) > len(current_text):
+                        # Heuristic: if it doesn't start with current_text but is longer,
+                        # it might be a fixup or we missed some deltas.
+                        # Yielding the whole thing might cause duplicates, but
+                        # yielding nothing might lose data.
+                        # For now, let's be conservative and only yield if it starts with current_text
+                        # or if current_text is empty.
+                        if not current_text:
+                            delta = full_text
+                        else:
+                            delta = ""
                     else:
-                        delta = full_text
-                    current_text = full_text
+                        delta = ""
+
                     if delta:
+                        current_text = full_text
                         yielded = True
                         yield delta
 
