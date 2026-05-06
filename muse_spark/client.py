@@ -542,13 +542,14 @@ async def stream_text_deltas(
     mode: str = DEFAULT_MODE,
     user_agent: str = DEFAULT_USER_AGENT,
     switch_mode_first: bool = False,
-    receive_timeout: float = 10.0,
+    receive_timeout: float = 30.0,
     template_name: str = HOME_TEMPLATE_NAME,
 ) -> AsyncIterator[str]:
     try:
         import websockets
     except ImportError as exc:
         raise RuntimeError("websockets is not installed. Create a venv and `pip install websockets`.") from exc
+    from websockets.exceptions import ConnectionClosed
 
     connection_request_id = str(uuid.uuid4())
     prompt_request_id = str(uuid.uuid4())
@@ -569,6 +570,8 @@ async def stream_text_deltas(
 
     yielded = False
     current_text = ""
+    seen_completion_signal = False
+
     async with websockets.connect(uri, additional_headers=headers) as websocket:
         await websocket.send(build_intro_frame(conversation_id))
         await websocket.send(
@@ -583,6 +586,19 @@ async def stream_text_deltas(
             try:
                 payload = await asyncio.wait_for(websocket.recv(), timeout=receive_timeout)
             except asyncio.TimeoutError:
+                # Idle timeout. If we never yielded anything, the request
+                # didn't produce text — let the post-loop check raise. If we
+                # already saw a completion signal, this is the natural end of
+                # stream. Otherwise the response stalled mid-generation, which
+                # is what the previous version silently masked.
+                if yielded and not seen_completion_signal:
+                    raise ProviderProtocolError(
+                        "Meta stream stalled mid-response: no data received within "
+                        f"{receive_timeout:.1f}s. Output may be truncated."
+                    )
+                break
+            except ConnectionClosed:
+                # Server closed the WebSocket — treat as natural end.
                 break
             payload_bytes = payload.encode("utf-8") if isinstance(payload, str) else payload
             objects = extract_json_objects(payload_bytes)
@@ -590,46 +606,112 @@ async def stream_text_deltas(
                 event_type = event.get("type")
                 if event_type == "patch":
                     for operation in event.get("operations", []):
+                        op_kind = operation.get("op")
+                        op_path = operation.get("path")
                         if (
-                            operation.get("op") == "delta"
-                            and operation.get("path") == "/sections/0/view_model/primitive/text"
+                            op_kind == "delta"
+                            and op_path == "/sections/0/view_model/primitive/text"
                             and isinstance(operation.get("value"), str)
                         ):
                             delta = operation["value"]
                             current_text += delta
                             yielded = True
                             yield delta
+                        elif (
+                            op_kind == "replace"
+                            and op_path == "/sections/0/view_model/primitive/text"
+                            and isinstance(operation.get("value"), str)
+                        ):
+                            new_text = operation["value"]
+                            for resync_chunk in _resync_text(current_text, new_text):
+                                yielded = True
+                                yield resync_chunk
+                            current_text = new_text
+                        elif _is_completion_op(op_kind, op_path, operation.get("value")):
+                            seen_completion_signal = True
                 elif event_type == "full":
                     full_text = _event_full_text(event)
-                    if not isinstance(full_text, str) or full_text == current_text:
-                        continue
-                    # Ensure we only yield if it's longer than what we have,
-                    # and try to only yield the new suffix.
-                    if full_text.startswith(current_text):
-                        delta = full_text[len(current_text) :]
-                    elif len(full_text) > len(current_text):
-                        # Heuristic: if it doesn't start with current_text but is longer,
-                        # it might be a fixup or we missed some deltas.
-                        # Yielding the whole thing might cause duplicates, but
-                        # yielding nothing might lose data.
-                        # For now, let's be conservative and only yield if it starts with current_text
-                        # or if current_text is empty.
-                        if not current_text:
-                            delta = full_text
-                        else:
-                            logger.debug("full event mismatch: doesn't start with current_text and current_text is not empty")
-                            delta = ""
-                    else:
-                        logger.debug("full event mismatch: not longer than current_text")
-                        delta = ""
-
-                    if delta:
+                    if isinstance(full_text, str) and full_text != current_text:
+                        for resync_chunk in _resync_text(current_text, full_text):
+                            yielded = True
+                            yield resync_chunk
                         current_text = full_text
-                        yielded = True
-                        yield delta
+                    if _event_is_complete(event):
+                        seen_completion_signal = True
+                elif event_type in {"complete", "completion", "done"}:
+                    seen_completion_signal = True
+            if seen_completion_signal:
+                # Drain any remaining buffered events but exit promptly so
+                # follow-up turns don't have to wait for the full timeout.
+                break
 
     if not yielded:
         raise ProviderProtocolError("Meta transport returned no usable text response.")
+
+
+def _is_completion_op(op_kind: Optional[str], op_path: Optional[str], op_value: Any) -> bool:
+    """Best-effort detection of an end-of-stream signal in a patch operation."""
+    if op_kind != "replace" or not isinstance(op_path, str):
+        return False
+    if op_path.endswith("/state") and isinstance(op_value, str) and op_value.upper() in {
+        "COMPLETE",
+        "DONE",
+        "FINISHED",
+    }:
+        return True
+    if op_path.endswith("/is_complete") and op_value is True:
+        return True
+    return False
+
+
+def _event_is_complete(event: dict[str, Any]) -> bool:
+    response = event.get("response")
+    if not isinstance(response, dict):
+        return False
+    state = response.get("state") or response.get("status")
+    if isinstance(state, str) and state.upper() in {"COMPLETE", "DONE", "FINISHED"}:
+        return True
+    if response.get("is_complete") is True:
+        return True
+    return False
+
+
+def _resync_text(current: str, new_full: str) -> list[str]:
+    """Return the chunks needed to bring streamed text in line with ``new_full``.
+
+    - If ``new_full`` extends ``current`` cleanly, return only the suffix.
+    - If they diverge (Meta corrected an earlier token), return a sentinel
+      replacement chunk that callers can treat as a full overwrite. We
+      currently approximate this as: emit only the suffix from the longest
+      common prefix onward, so the user-visible text stays close to what
+      Meta intends without losing characters.
+    - If ``new_full`` is shorter or identical, return [].
+    """
+    if not isinstance(new_full, str):
+        return []
+    if new_full == current:
+        return []
+    if new_full.startswith(current):
+        suffix = new_full[len(current):]
+        return [suffix] if suffix else []
+    if not current:
+        return [new_full]
+    # Diverged. Find the longest common prefix and emit the divergent tail.
+    common_len = 0
+    for ch_a, ch_b in zip(current, new_full):
+        if ch_a != ch_b:
+            break
+        common_len += 1
+    tail = new_full[common_len:]
+    if not tail:
+        return []
+    logger.debug(
+        "stream resync: diverged at index %d (current_len=%d, new_len=%d)",
+        common_len,
+        len(current),
+        len(new_full),
+    )
+    return [tail]
 
 
 def _ensure_text_reply(text: Any) -> str:
@@ -734,7 +816,7 @@ async def generate_text(
     mode: str = DEFAULT_MODE,
     user_agent: str = DEFAULT_USER_AGENT,
     switch_mode_first: bool = False,
-    receive_timeout: float = 4.0,
+    receive_timeout: float = 30.0,
     template_name: str = HOME_TEMPLATE_NAME,
 ) -> str:
     parts: list[str] = []
@@ -878,9 +960,24 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser = subparsers.add_parser("serve", help="Run the local OpenAI-compatible API server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
-    serve_parser.add_argument("--single-conversation", action="store_true", help="Force a single persistent conversation")
-    serve_parser.add_argument("--chunk-size", type=int, default=0, help="SSE chunk size (0 to disable)")
-    serve_parser.add_argument("--timeout", type=float, default=10.0, help="Receive timeout in seconds")
+    serve_parser.add_argument(
+        "--single-conversation",
+        action="store_true",
+        default=None,
+        help="Force a single persistent conversation. When omitted, MUSE_SPARK_FORCE_SINGLE_CONVERSATION env var is honored.",
+    )
+    serve_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="SSE chunk size (0 to disable). When omitted, MUSE_SPARK_STREAM_CHUNK_SIZE env var is honored.",
+    )
+    serve_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Receive timeout in seconds. When omitted, MUSE_SPARK_RECEIVE_TIMEOUT env var is honored.",
+    )
 
     return parser
 

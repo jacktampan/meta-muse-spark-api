@@ -30,9 +30,13 @@ class MuseProviderRequest:
     prompt: str
     conversation_id: Optional[str] = None
     template_name: str = HOME_TEMPLATE_NAME
-    receive_timeout: float = 10.0
+    receive_timeout: float = 30.0
     bootstrap_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
+    # When False, callers signal the conversation is already warm on Meta's
+    # side and the per-request warmup + mode_switch GraphQL round-trips can
+    # be skipped, halving follow-up latency.
+    needs_warmup: bool = True
 
 
 @dataclass
@@ -49,6 +53,7 @@ class ResolvedConversation:
     client_conversation_id: str
     meta_conversation_id: str
     template_name: str
+    is_new: bool = True
 
 
 WarmupFn = Callable[..., Any]
@@ -87,6 +92,7 @@ def resolve_api_conversation(
             client_conversation_id=client_conversation_id,
             meta_conversation_id=mapping["meta_conversation_id"],
             template_name=CHAT_TEMPLATE_NAME,
+            is_new=False,
         )
 
     resolved_client_id = client_conversation_id or str(uuid.uuid4())
@@ -101,6 +107,7 @@ def resolve_api_conversation(
         client_conversation_id=resolved_client_id,
         meta_conversation_id=resolved_meta_id,
         template_name=HOME_TEMPLATE_NAME,
+        is_new=True,
     )
 
 
@@ -115,19 +122,20 @@ async def generate_from_state_async(
     auth = await asyncio.to_thread(load_provider_auth, state_path)
     conversation_id = request.conversation_id or str(conversation_id_factory())
 
-    await asyncio.to_thread(
-        warmup_fn,
-        conversation_id,
-        auth["cookie_header"],
-        user_agent=auth["user_agent"],
-    )
-    await asyncio.to_thread(
-        mode_switch_fn,
-        conversation_id=conversation_id,
-        cookie_header=auth["cookie_header"],
-        mode=auth["mode"],
-        user_agent=auth["user_agent"],
-    )
+    if request.needs_warmup:
+        await asyncio.to_thread(
+            warmup_fn,
+            conversation_id,
+            auth["cookie_header"],
+            user_agent=auth["user_agent"],
+        )
+        await asyncio.to_thread(
+            mode_switch_fn,
+            conversation_id=conversation_id,
+            cookie_header=auth["cookie_header"],
+            mode=auth["mode"],
+            user_agent=auth["user_agent"],
+        )
     bootstrap_prompt = request.bootstrap_prompt or ""
     user_prompt = request.user_prompt or request.prompt
     if bootstrap_prompt:
@@ -174,19 +182,20 @@ async def stream_from_state_async(
     auth = await asyncio.to_thread(load_provider_auth, state_path)
     conversation_id = request.conversation_id or str(conversation_id_factory())
 
-    await asyncio.to_thread(
-        warmup_fn,
-        conversation_id,
-        auth["cookie_header"],
-        user_agent=auth["user_agent"],
-    )
-    await asyncio.to_thread(
-        mode_switch_fn,
-        conversation_id=conversation_id,
-        cookie_header=auth["cookie_header"],
-        mode=auth["mode"],
-        user_agent=auth["user_agent"],
-    )
+    if request.needs_warmup:
+        await asyncio.to_thread(
+            warmup_fn,
+            conversation_id,
+            auth["cookie_header"],
+            user_agent=auth["user_agent"],
+        )
+        await asyncio.to_thread(
+            mode_switch_fn,
+            conversation_id=conversation_id,
+            cookie_header=auth["cookie_header"],
+            mode=auth["mode"],
+            user_agent=auth["user_agent"],
+        )
     bootstrap_prompt = request.bootstrap_prompt or ""
     user_prompt = request.user_prompt or request.prompt
     if bootstrap_prompt:

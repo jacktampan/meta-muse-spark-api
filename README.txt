@@ -105,13 +105,27 @@ API settings from env
 - `MUSE_SPARK_STREAM_CHUNK_SIZE` default: `0` (0 to disable artificial chunking)
 - `MUSE_SPARK_DEBUG_FRAME_DUMPS` default: `0`
 - `MUSE_SPARK_FORCE_SINGLE_CONVERSATION` default: `0` (Set to 1 to stick to one conversation)
-- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `10.0`
+- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `30.0`
+
+Sticky conversation for agent frameworks
+Most OpenAI-compatible client libraries (LangChain, LlamaIndex, the OpenAI SDK,
+AutoGen, etc.) do not pass a `conversation_id` field, so by default every
+incoming /v1/chat/completions call would start a brand-new Meta conversation.
+The API resolves the conversation in the following priority order:
+  1. `body.conversation_id` (vendor extension on the request body)
+  2. `X-Conversation-Id` request header (recommended for agent frameworks)
+  3. `muse_spark_conv` cookie (auto-set on every response, useful for browsers)
+  4. `--single-conversation` / `MUSE_SPARK_FORCE_SINGLE_CONVERSATION=1` (a
+     single shared conversation for the whole server)
+This makes it trivial to wire Muse Spark behind agents that don't know about
+the `conversation_id` body field.
 
 Notes
 - The API is stateful: each OpenAI conversation_id maps to a persistent Meta conversation under the hood.
 - Use `--single-conversation` if you want all requests to share the exact same history (useful for simple agents).
 - New conversations use a hidden bootstrap turn, then the real user turn.
-- Follow ups reuse the same conversation_id and send only the latest user message.
+- Follow ups reuse the same conversation_id and send only the latest user message; the per-request `warmup_conversation` and `mode_switch` GraphQL round-trips are skipped to halve follow-up latency.
+- If a stream stalls mid-response (no data within `MUSE_SPARK_RECEIVE_TIMEOUT`) the API returns a final SSE chunk with `finish_reason="error"` and `[DONE]` instead of silently truncating.
 - The stateless transcript compiler is removed; stateful XML turn planning is the only chat path.
 - The CLI stores known conversations locally in `~/.muse_spark/state.json`.
 - If auth expires, rerun `auth set` with fresh Charles values.

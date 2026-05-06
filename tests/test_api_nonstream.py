@@ -137,6 +137,150 @@ class ApiNonStreamingTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["error"]["code"], "missing_auth")
 
+    def test_chat_completions_uses_x_conversation_id_header_when_body_lacks_one(self):
+        seen = []
+
+        async def fake_provider(request, state_path=None):
+            seen.append(request)
+            return MuseProviderResponse(
+                text="ok",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            app = create_app(provider_generate_fn=fake_provider, state_path=state_path)
+            client = TestClient(app)
+
+            first = client.post(
+                "/v1/chat/completions",
+                headers={"X-Conversation-Id": "agent-session-42"},
+                json={
+                    "model": "meta/muse-spark",
+                    "messages": [{"role": "user", "content": "first"}],
+                },
+            )
+            second = client.post(
+                "/v1/chat/completions",
+                headers={"X-Conversation-Id": "agent-session-42"},
+                json={
+                    "model": "meta/muse-spark",
+                    "messages": [{"role": "user", "content": "second"}],
+                },
+            )
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(first.json()["conversation_id"], "agent-session-42")
+            self.assertEqual(second.json()["conversation_id"], "agent-session-42")
+            # First turn boots up: bootstrap (home) + main (chat). Second turn
+            # is a follow-up: chat only, no bootstrap.
+            self.assertEqual([req.template_name for req in seen], ["home", "chat", "chat"])
+
+    def test_chat_completions_skips_warmup_for_followup_conversation(self):
+        seen = []
+
+        async def fake_provider(request, state_path=None):
+            seen.append(request)
+            return MuseProviderResponse(
+                text="ok",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            app = create_app(provider_generate_fn=fake_provider, state_path=state_path)
+            client = TestClient(app)
+
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "meta/muse-spark",
+                    "conversation_id": "conv-warmup",
+                    "messages": [{"role": "user", "content": "first"}],
+                },
+            )
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "meta/muse-spark",
+                    "conversation_id": "conv-warmup",
+                    "messages": [{"role": "user", "content": "second"}],
+                },
+            )
+
+            # First turn: bootstrap warms the conversation, main call skips warmup.
+            self.assertTrue(seen[0].needs_warmup)
+            self.assertFalse(seen[1].needs_warmup)
+            # Follow-up turn: no warmup at all (conversation already exists).
+            self.assertFalse(seen[2].needs_warmup)
+
+    def test_chat_completions_strips_scaffolding_tags_from_response(self):
+        async def fake_provider(request, state_path=None):
+            return MuseProviderResponse(
+                text="<conversation_turn><user_message>Hello, world!</user_message></conversation_turn>",
+                conversation_id="meta-1",
+                template_name="chat",
+            )
+
+        app = create_app(provider_generate_fn=fake_provider)
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        content = response.json()["choices"][0]["message"]["content"]
+        self.assertEqual(content, "Hello, world!")
+
+    def test_chat_completions_rejects_empty_messages_list_with_400(self):
+        async def fake_provider(request, state_path=None):
+            return MuseProviderResponse(
+                text="should not be used",
+                conversation_id="meta-1",
+                template_name="home",
+            )
+
+        app = create_app(provider_generate_fn=fake_provider)
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "meta/muse-spark", "messages": []},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_chat_completions_sets_sticky_conversation_cookie(self):
+        async def fake_provider(request, state_path=None):
+            return MuseProviderResponse(
+                text="ok",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        app = create_app(provider_generate_fn=fake_provider)
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("muse_spark_conv", response.cookies)
+
     def test_models_endpoint_lists_meta_muse_spark(self):
         app = create_app()
         client = TestClient(app)
