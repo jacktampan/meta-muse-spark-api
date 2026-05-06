@@ -30,7 +30,7 @@ class MuseProviderRequest:
     prompt: str
     conversation_id: Optional[str] = None
     template_name: str = HOME_TEMPLATE_NAME
-    receive_timeout: float = 4.0
+    receive_timeout: float = 10.0
     bootstrap_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
 
@@ -76,7 +76,7 @@ def resolve_api_conversation(
     mappings = state.setdefault(API_CONVERSATIONS_KEY, {})
     now = int(time.time())
 
-    if force_single_conversation and not client_conversation_id:
+    if force_single_conversation:
         client_conversation_id = "default-single-conversation"
 
     if client_conversation_id and client_conversation_id in mappings:

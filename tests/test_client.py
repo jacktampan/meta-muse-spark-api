@@ -272,7 +272,14 @@ class MuseSparkClientTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            fake_run.assert_called_once_with(host="0.0.0.0", port=9001, state_path=state_path)
+            fake_run.assert_called_once_with(
+                host="0.0.0.0",
+                port=9001,
+                state_path=state_path,
+                force_single_conversation=False,
+                stream_chunk_size=0,
+                receive_timeout=10.0,
+            )
 
     def test_run_api_server_prints_startup_banner(self):
         from muse_spark.api import run_api_server

@@ -77,6 +77,8 @@ class ApiNonStreamingTests(unittest.TestCase):
             self.assertEqual(second.status_code, 200)
             self.assertEqual(second_payload["conversation_id"], conversation_id)
             self.assertEqual(seen[0].template_name, "home")
+            # In single conversation mode or persistent state, we expect second turn to be chat.
+            # But the mock should have recorded it.
             self.assertEqual(seen[1].template_name, "chat")
             self.assertEqual(seen[0].conversation_id, seen[1].conversation_id)
 
