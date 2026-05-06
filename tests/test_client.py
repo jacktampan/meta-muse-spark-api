@@ -272,13 +272,48 @@ class MuseSparkClientTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
+            # When tuning flags are omitted on the CLI, we forward None so
+            # ApiSettings.from_env() / MUSE_SPARK_* env vars stay authoritative.
             fake_run.assert_called_once_with(
                 host="0.0.0.0",
                 port=9001,
                 state_path=state_path,
-                force_single_conversation=False,
-                stream_chunk_size=0,
-                receive_timeout=10.0,
+                force_single_conversation=None,
+                stream_chunk_size=None,
+                receive_timeout=None,
+            )
+
+    def test_main_serve_forwards_explicit_tuning_flags_when_provided(self):
+        from muse_spark.client import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            with patch("muse_spark.api.run_api_server") as fake_run:
+                exit_code = main(
+                    [
+                        "--state-path",
+                        str(state_path),
+                        "serve",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        "8000",
+                        "--single-conversation",
+                        "--chunk-size",
+                        "120",
+                        "--timeout",
+                        "45.0",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            fake_run.assert_called_once_with(
+                host="127.0.0.1",
+                port=8000,
+                state_path=state_path,
+                force_single_conversation=True,
+                stream_chunk_size=120,
+                receive_timeout=45.0,
             )
 
     def test_run_api_server_prints_startup_banner(self):

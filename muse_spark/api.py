@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Union
@@ -51,6 +52,65 @@ def _chunk_text(text: str, chunk_size: int) -> list[str]:
     return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)] or [""]
 
 
+# Tags emitted by build_stateful_turn_plan that may leak back from Meta's
+# stateful conversation context into user-visible output. We strip them from
+# both streaming and non-streaming responses.
+_SCAFFOLDING_TAG_PATTERN = re.compile(
+    r"</?(?:conversation_setup|conversation_turn|user_message|system_instructions|"
+    r"conversation_preamble|instruction|acknowledgement)\b[^>]*>",
+    re.IGNORECASE,
+)
+_SCAFFOLDING_BARE_READY = re.compile(r"^\s*READY\.?\s*$", re.IGNORECASE)
+
+
+def _clean_assistant_text(text: Optional[str]) -> str:
+    """Strip stateful-turn scaffolding tags that occasionally leak into output."""
+    if not text:
+        return ""
+    cleaned = _SCAFFOLDING_TAG_PATTERN.sub("", text)
+    if _SCAFFOLDING_BARE_READY.match(cleaned):
+        return ""
+    return cleaned
+
+
+class _ScaffoldingStripper:
+    """Streaming-safe stripper for scaffolding tags split across SSE chunks.
+
+    Holds back only when a chunk ends with what could be a partial tag opener
+    (``<`` without a matching ``>``). All other content is emitted immediately,
+    preserving streaming UX.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buffer += chunk
+        last_open = self._buffer.rfind("<")
+        if last_open == -1:
+            emit = self._buffer
+            self._buffer = ""
+            return emit
+        suffix = self._buffer[last_open:]
+        if ">" in suffix:
+            emit = _SCAFFOLDING_TAG_PATTERN.sub("", self._buffer)
+            self._buffer = ""
+            return emit
+        # Partial tag at end — hold from the opener onward, emit the rest.
+        emit = _SCAFFOLDING_TAG_PATTERN.sub("", self._buffer[:last_open])
+        self._buffer = suffix
+        return emit
+
+    def flush(self) -> str:
+        cleaned = _SCAFFOLDING_TAG_PATTERN.sub("", self._buffer)
+        self._buffer = ""
+        if _SCAFFOLDING_BARE_READY.match(cleaned):
+            return ""
+        return cleaned
+
+
 
 def run_api_server(
     *,
@@ -90,6 +150,8 @@ async def _stream_chat_completion(
     logger: Any,
     bootstrap_response: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
+    # Send role chunk first so clients (including OpenAI SDK) see the connection
+    # is alive immediately, even if the upstream provider is still warming up.
     yield encode_sse_data(
         build_chat_completion_chunk(
             model=model,
@@ -99,9 +161,15 @@ async def _stream_chat_completion(
             bootstrap_response=bootstrap_response,
         )
     )
+
+    stripper = _ScaffoldingStripper()
+    finish_reason = "stop"
     try:
         async for provider_chunk in chunk_iter:
-            for chunk in _chunk_text(provider_chunk, chunk_size):
+            cleaned = stripper.feed(provider_chunk)
+            if not cleaned:
+                continue
+            for chunk in _chunk_text(cleaned, chunk_size):
                 if chunk:
                     yield encode_sse_data(
                         build_chat_completion_chunk(
@@ -109,22 +177,41 @@ async def _stream_chat_completion(
                             response_id=response_id,
                             delta={"content": chunk},
                             conversation_id=conversation_id,
-                        # Only include bootstrap in the very first content chunk
-                        # to keep the payload small.
+                            # Only include bootstrap in the very first content chunk
+                            # to keep the payload small.
                             bootstrap_response=bootstrap_response,
                         )
                     )
                 bootstrap_response = None
     except Exception:
         logger.exception("streaming_failed")
-        return
+        finish_reason = "error"
+    else:
+        # Flush any buffered tail (e.g. an in-progress tag that turned out
+        # not to be a tag, or any trailing content shorter than the buffer).
+        tail = stripper.flush()
+        if tail:
+            for chunk in _chunk_text(tail, chunk_size):
+                if chunk:
+                    yield encode_sse_data(
+                        build_chat_completion_chunk(
+                            model=model,
+                            response_id=response_id,
+                            delta={"content": chunk},
+                            conversation_id=conversation_id,
+                            bootstrap_response=bootstrap_response,
+                        )
+                    )
+                bootstrap_response = None
 
+    # Always emit a terminal chunk + [DONE] so clients don't hang. Use
+    # finish_reason="error" on failure so callers can detect partial output.
     yield encode_sse_data(
         build_chat_completion_chunk(
             model=model,
             response_id=response_id,
             delta={},
-            finish_reason="stop",
+            finish_reason=finish_reason,
             conversation_id=conversation_id,
             bootstrap_response=bootstrap_response,
         )
@@ -193,29 +280,51 @@ def create_app(
         return build_models_response([settings.model_name])
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(body: ChatCompletionsRequest):
+    async def chat_completions(request: Request, body: ChatCompletionsRequest):
         if body.model != settings.model_name:
             return error_json(400, "invalid_model", f"Unsupported model: {body.model}")
 
-        compiled = compiler_fn([message.model_dump() for message in body.messages])
+        if not body.messages:
+            return error_json(400, "invalid_request", "messages must not be empty")
+
+        try:
+            compiled = compiler_fn([message.model_dump() for message in body.messages])
+        except ValueError as exc:
+            return error_json(400, "invalid_request", str(exc))
+
+        # Sticky conversation resolution priority:
+        #   1. body.conversation_id (explicit, OpenAI vendor extension)
+        #   2. X-Conversation-Id header (agent frameworks that expose custom headers)
+        #   3. muse_spark_conv cookie (browser-style clients)
+        #   4. settings.force_single_conversation (server-wide single conversation mode)
+        sticky_id = (
+            body.conversation_id
+            or request.headers.get("x-conversation-id")
+            or request.cookies.get("muse_spark_conv")
+        )
         resolved = resolve_api_conversation(
             state_path=state_path,
-            client_conversation_id=body.conversation_id,
+            client_conversation_id=sticky_id,
             force_single_conversation=settings.force_single_conversation,
         )
 
         main_template = resolved.template_name
         bootstrap_response_text: Optional[str] = None
+        # Bootstrap warms the conversation on Meta side; subsequent calls in
+        # the same request don't need their own warmup/mode_switch round-trip.
+        bootstrap_already_warmed = False
         if resolved.template_name == HOME_TEMPLATE_NAME and compiled.bootstrap_prompt:
             bootstrap_response = await provider_generate_fn(
                 MuseProviderRequest(
                     prompt=compiled.bootstrap_prompt,
                     conversation_id=resolved.meta_conversation_id,
                     template_name=HOME_TEMPLATE_NAME,
+                    needs_warmup=resolved.is_new,
                 ),
                 state_path=state_path,
             )
             main_template = CHAT_TEMPLATE_NAME
+            bootstrap_already_warmed = True
             if body.include_bootstrap_response:
                 bootstrap_response_text = bootstrap_response.text
 
@@ -225,12 +334,15 @@ def create_app(
             template_name=main_template,
             user_prompt=compiled.user_prompt,
             receive_timeout=settings.receive_timeout,
+            # Skip warmup for follow-ups (conversation already exists on Meta)
+            # and for the second call in a bootstrap round (just warmed).
+            needs_warmup=resolved.is_new and not bootstrap_already_warmed,
         )
 
         if body.stream:
             response_id = f"chatcmpl-{uuid.uuid4()}"
             chunk_iter = provider_stream_fn(provider_request, state_path=state_path)
-            return StreamingResponse(
+            response = StreamingResponse(
                 _stream_chat_completion(
                     chunk_iter=chunk_iter,
                     model=settings.model_name,
@@ -242,13 +354,31 @@ def create_app(
                 ),
                 media_type="text/event-stream",
             )
+            response.set_cookie(
+                "muse_spark_conv",
+                resolved.client_conversation_id,
+                max_age=60 * 60 * 24 * 30,
+                httponly=True,
+                samesite="lax",
+            )
+            return response
 
         provider_response = await provider_generate_fn(provider_request, state_path=state_path)
-        return build_chat_completion_response(
-            content=provider_response.text,
-            model=settings.model_name,
-            conversation_id=resolved.client_conversation_id,
-            bootstrap_response=bootstrap_response_text,
+        response = JSONResponse(
+            content=build_chat_completion_response(
+                content=_clean_assistant_text(provider_response.text),
+                model=settings.model_name,
+                conversation_id=resolved.client_conversation_id,
+                bootstrap_response=bootstrap_response_text,
+            )
         )
+        response.set_cookie(
+            "muse_spark_conv",
+            resolved.client_conversation_id,
+            max_age=60 * 60 * 24 * 30,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
 
     return app

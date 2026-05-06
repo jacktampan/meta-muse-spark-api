@@ -84,5 +84,82 @@ class ApiStreamingTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn('"content":"initial"', body)
-        # Should NOT contain DONE because it failed before reaching it
-        self.assertNotIn('data: [DONE]', body)
+        # On stream failure we must still emit a terminal chunk + [DONE] so
+        # OpenAI SDK clients don't hang waiting for the stream to close.
+        # The terminal chunk carries finish_reason="error" so callers can
+        # detect that output is partial.
+        self.assertIn('"finish_reason":"error"', body)
+        self.assertIn('data: [DONE]', body)
+
+    def test_chat_completions_stream_strips_scaffolding_tags_across_chunks(self):
+        async def fake_provider_stream(request, state_path=None):
+            # Tag split across chunks must still be removed.
+            for chunk in ["Hello", " <user_mes", "sage>world</user_message> done"]:
+                yield chunk
+
+        async def fake_provider_generate(request, state_path=None):
+            return MuseProviderResponse(text="fake", conversation_id="m", template_name="home")
+
+        app = create_app(
+            provider_generate_fn=fake_provider_generate,
+            provider_stream_fn=fake_provider_stream,
+        )
+        client = TestClient(app)
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes()).decode("utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        # Concatenate all delta.content fragments and verify scaffolding gone.
+        import json
+        contents = []
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: ") or line.endswith("[DONE]"):
+                continue
+            event = json.loads(line[len("data: "):])
+            delta = event["choices"][0].get("delta", {})
+            if "content" in delta:
+                contents.append(delta["content"])
+        joined = "".join(contents)
+        self.assertNotIn("<user_message", joined)
+        self.assertNotIn("</user_message", joined)
+        self.assertIn("Hello", joined)
+        self.assertIn("world", joined)
+        self.assertIn("done", joined)
+        self.assertIn('data: [DONE]', body)
+
+    def test_chat_completions_stream_sets_sticky_conversation_cookie(self):
+        async def fake_provider_stream(request, state_path=None):
+            yield "ok"
+
+        async def fake_provider_generate(request, state_path=None):
+            return MuseProviderResponse(text="fake", conversation_id="m", template_name="home")
+
+        app = create_app(
+            provider_generate_fn=fake_provider_generate,
+            provider_stream_fn=fake_provider_stream,
+        )
+        client = TestClient(app)
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+        ) as response:
+            # Drain so the response completes and cookies become available.
+            b"".join(response.iter_bytes())
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("muse_spark_conv", response.cookies)
