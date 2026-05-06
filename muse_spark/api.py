@@ -63,10 +63,10 @@ _SCAFFOLDING_TAG_PATTERN = re.compile(
 _SCAFFOLDING_BARE_READY = re.compile(r"^\s*READY\.?\s*$", re.IGNORECASE)
 
 
-def _clean_assistant_text(text: str) -> str:
+def _clean_assistant_text(text: Optional[str]) -> str:
     """Strip stateful-turn scaffolding tags that occasionally leak into output."""
     if not text:
-        return text
+        return ""
     cleaned = _SCAFFOLDING_TAG_PATTERN.sub("", text)
     if _SCAFFOLDING_BARE_READY.match(cleaned):
         return ""

@@ -27,12 +27,32 @@ class ResyncTextTests(unittest.TestCase):
     def test_empty_current_returns_full_new(self):
         self.assertEqual(_resync_text("", "hello world"), ["hello world"])
 
-    def test_diverged_returns_tail_after_common_prefix(self):
-        # Meta sometimes corrects an earlier token; emit the divergent tail
-        # so the user-visible text follows Meta's final intent without losing
-        # the preserved prefix.
+    def test_late_divergence_returns_tail_after_common_prefix(self):
+        # Meta corrected the last word — small backtrack, accept duplication
+        # to converge on Meta's final text.
         result = _resync_text("Hello, world!", "Hello, World!")
         self.assertEqual(result, ["World!"])
+
+    def test_large_backtrack_drops_correction(self):
+        # If Meta rewrites a long span we already streamed, emitting the
+        # divergent tail would just stack garbled duplication on top of
+        # the original (SSE can't retract bytes). Drop the correction.
+        current = "x" + "a" * 200  # 201 chars, divergence at index 1
+        new_full = "x" + "b" * 200
+        self.assertEqual(_resync_text(current, new_full), [])
+
+    def test_backtrack_threshold_is_inclusive(self):
+        # backtrack==max_backtrack is still applied; backtrack>max_backtrack drops.
+        current = "abcdefghij"  # 10 chars
+        new_full = "abXXXXXXXX"  # diverges at index 2 → backtrack=8
+        self.assertEqual(
+            _resync_text(current, new_full, max_backtrack=8),
+            ["XXXXXXXX"],
+        )
+        self.assertEqual(
+            _resync_text(current, new_full, max_backtrack=7),
+            [],
+        )
 
     def test_shorter_new_returns_empty(self):
         # We never roll back already-streamed characters.
@@ -78,6 +98,12 @@ class CleanAssistantTextTests(unittest.TestCase):
 
     def test_preserves_normal_text(self):
         self.assertEqual(_clean_assistant_text("Hello, world!"), "Hello, world!")
+
+    def test_returns_empty_string_for_none_or_empty_input(self):
+        # Type annotation says ``str`` so callers (e.g. JSON serialisation)
+        # don't have to defensively handle None.
+        self.assertEqual(_clean_assistant_text(None), "")
+        self.assertEqual(_clean_assistant_text(""), "")
 
 
 class ScaffoldingStripperTests(unittest.TestCase):

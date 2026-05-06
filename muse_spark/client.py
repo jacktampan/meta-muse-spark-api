@@ -641,8 +641,9 @@ async def stream_text_deltas(
                 elif event_type in {"complete", "completion", "done"}:
                     seen_completion_signal = True
             if seen_completion_signal:
-                # Drain any remaining buffered events but exit promptly so
-                # follow-up turns don't have to wait for the full timeout.
+                # Meta signalled end-of-stream for this turn. Exit immediately
+                # instead of waiting on the recv() idle timeout — anything
+                # arriving after this would belong to the next turn.
                 break
 
     if not yielded:
@@ -676,15 +677,35 @@ def _event_is_complete(event: dict[str, Any]) -> bool:
     return False
 
 
-def _resync_text(current: str, new_full: str) -> list[str]:
+# When Meta corrects an already-streamed token (typo fix at the tail of
+# the response), emitting the corrected suffix is acceptable — callers see
+# a small amount of duplication but the final text is correct. When the
+# divergence is much earlier (Meta rewrote a long span we already streamed),
+# emitting the divergent tail produces visibly garbled output because SSE
+# has no way to retract previously streamed bytes. In that case we drop the
+# correction; subsequent deltas usually reconverge as the response stabilises.
+_RESYNC_MAX_BACKTRACK = 32
+
+
+def _resync_text(
+    current: str,
+    new_full: str,
+    *,
+    max_backtrack: int = _RESYNC_MAX_BACKTRACK,
+) -> list[str]:
     """Return the chunks needed to bring streamed text in line with ``new_full``.
 
     - If ``new_full`` extends ``current`` cleanly, return only the suffix.
-    - If they diverge (Meta corrected an earlier token), return a sentinel
-      replacement chunk that callers can treat as a full overwrite. We
-      currently approximate this as: emit only the suffix from the longest
-      common prefix onward, so the user-visible text stays close to what
-      Meta intends without losing characters.
+    - If they diverge in the last ``max_backtrack`` characters of
+      ``current`` (typo-style late correction), return the divergent tail
+      so the user-visible text catches up to Meta's final intent. This
+      duplicates a short overlap on the wire — the trade-off is a few
+      duplicated chars vs. permanently stale text.
+    - If they diverge earlier (Meta rewrote a long span we already
+      streamed), return ``[]``: the SSE protocol can't retract already
+      sent bytes, so emitting the tail would just stack garbled
+      duplication on top of the original. Subsequent deltas tend to
+      reconverge as the response stabilises.
     - If ``new_full`` is shorter or identical, return [].
     """
     if not isinstance(new_full, str):
@@ -696,18 +717,28 @@ def _resync_text(current: str, new_full: str) -> list[str]:
         return [suffix] if suffix else []
     if not current:
         return [new_full]
-    # Diverged. Find the longest common prefix and emit the divergent tail.
+    # Diverged. Find the longest common prefix.
     common_len = 0
     for ch_a, ch_b in zip(current, new_full):
         if ch_a != ch_b:
             break
         common_len += 1
+    backtrack = len(current) - common_len
+    if backtrack > max_backtrack:
+        logger.debug(
+            "stream resync: dropping divergent correction (backtrack=%d > %d, current_len=%d, new_len=%d)",
+            backtrack,
+            max_backtrack,
+            len(current),
+            len(new_full),
+        )
+        return []
     tail = new_full[common_len:]
     if not tail:
         return []
     logger.debug(
-        "stream resync: diverged at index %d (current_len=%d, new_len=%d)",
-        common_len,
+        "stream resync: applying late correction (backtrack=%d, current_len=%d, new_len=%d)",
+        backtrack,
         len(current),
         len(new_full),
     )
