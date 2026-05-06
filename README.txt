@@ -12,7 +12,7 @@ What it is not
 - Not a public API client.
 - Not a real login flow yet.
 - Still reverse engineered, so Meta can break it whenever they feel like being annoying.
-- Streaming is coarse SSE over the completed result for now, not true token streaming from Meta.
+- Streaming is now true token-level SSE (as received from Meta), no longer artificially chunked by default.
 
 Project layout
 - `muse_spark/client.py`: protobuf patcher, session store, HTTP helpers, CLI, protocol transport
@@ -74,6 +74,12 @@ Run the local API
 Start the server:
 `uv run muse-spark serve --host 127.0.0.1 --port 8000`
 
+Force a single persistent conversation for AI agents:
+`uv run muse-spark serve --single-conversation`
+
+Adjust streaming and timeouts:
+`uv run muse-spark serve --chunk-size 0 --timeout 15.0`
+
 Health check:
 `curl http://127.0.0.1:8000/healthz`
 
@@ -96,11 +102,14 @@ The CLI/API prefer values stored in `~/.muse_spark/state.json`, but they can als
 API settings from env
 - `MUSE_SPARK_MODEL_NAME` default: `meta/muse-spark`
 - `MUSE_SPARK_LOG_LEVEL` default: `INFO`
-- `MUSE_SPARK_STREAM_CHUNK_SIZE` default: `120`
+- `MUSE_SPARK_STREAM_CHUNK_SIZE` default: `0` (0 to disable artificial chunking)
 - `MUSE_SPARK_DEBUG_FRAME_DUMPS` default: `0`
+- `MUSE_SPARK_FORCE_SINGLE_CONVERSATION` default: `0` (Set to 1 to stick to one conversation)
+- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `10.0`
 
 Notes
 - The API is stateful: each OpenAI conversation_id maps to a persistent Meta conversation under the hood.
+- Use `--single-conversation` if you want all requests to share the exact same history (useful for simple agents).
 - New conversations use a hidden bootstrap turn, then the real user turn.
 - Follow ups reuse the same conversation_id and send only the latest user message.
 - The stateless transcript compiler is removed; stateful XML turn planning is the only chat path.

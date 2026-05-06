@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, Optional, Union
 
 from .errors import MissingAuthError, ProviderProtocolError, ProviderTransportError, ReauthRequiredError
+from .logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 INTRO_FRAME_TYPE = 0x0f
 PROMPT_FRAME_TYPE = 0x0d
@@ -539,7 +542,7 @@ async def stream_text_deltas(
     mode: str = DEFAULT_MODE,
     user_agent: str = DEFAULT_USER_AGENT,
     switch_mode_first: bool = False,
-    receive_timeout: float = 4.0,
+    receive_timeout: float = 10.0,
     template_name: str = HOME_TEMPLATE_NAME,
 ) -> AsyncIterator[str]:
     try:
@@ -600,12 +603,28 @@ async def stream_text_deltas(
                     full_text = _event_full_text(event)
                     if not isinstance(full_text, str) or full_text == current_text:
                         continue
+                    # Ensure we only yield if it's longer than what we have,
+                    # and try to only yield the new suffix.
                     if full_text.startswith(current_text):
                         delta = full_text[len(current_text) :]
+                    elif len(full_text) > len(current_text):
+                        # Heuristic: if it doesn't start with current_text but is longer,
+                        # it might be a fixup or we missed some deltas.
+                        # Yielding the whole thing might cause duplicates, but
+                        # yielding nothing might lose data.
+                        # For now, let's be conservative and only yield if it starts with current_text
+                        # or if current_text is empty.
+                        if not current_text:
+                            delta = full_text
+                        else:
+                            logger.debug("full event mismatch: doesn't start with current_text and current_text is not empty")
+                            delta = ""
                     else:
-                        delta = full_text
-                    current_text = full_text
+                        logger.debug("full event mismatch: not longer than current_text")
+                        delta = ""
+
                     if delta:
+                        current_text = full_text
                         yielded = True
                         yield delta
 
@@ -859,6 +878,9 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser = subparsers.add_parser("serve", help="Run the local OpenAI-compatible API server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser.add_argument("--single-conversation", action="store_true", help="Force a single persistent conversation")
+    serve_parser.add_argument("--chunk-size", type=int, default=0, help="SSE chunk size (0 to disable)")
+    serve_parser.add_argument("--timeout", type=float, default=10.0, help="Receive timeout in seconds")
 
     return parser
 
@@ -924,7 +946,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "serve":
         from .api import run_api_server
 
-        run_api_server(host=args.host, port=args.port, state_path=state_path)
+        run_api_server(
+            host=args.host,
+            port=args.port,
+            state_path=state_path,
+            force_single_conversation=args.single_conversation,
+            stream_chunk_size=args.chunk_size,
+            receive_timeout=args.timeout,
+        )
         return 0
 
     parser.error(f"unknown command: {args.command}")

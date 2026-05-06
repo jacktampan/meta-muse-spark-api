@@ -47,19 +47,36 @@ def _normalize_stop(stop: Optional[Union[str, list[str]]]) -> Optional[list[str]
 
 def _chunk_text(text: str, chunk_size: int) -> list[str]:
     if chunk_size <= 0:
-        chunk_size = 120
+        return [text] if text else [""]
     return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)] or [""]
 
 
 
-def run_api_server(*, host: str = "127.0.0.1", port: int = 8000, state_path: Union[Path, str] = DEFAULT_STATE_PATH) -> None:
+def run_api_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    state_path: Union[Path, str] = DEFAULT_STATE_PATH,
+    force_single_conversation: Optional[bool] = None,
+    stream_chunk_size: Optional[int] = None,
+    receive_timeout: Optional[float] = None,
+) -> None:
     import uvicorn
 
     print("Muse Spark API")
     print(f"  URL: http://{host}:{port}")
     print(f"  State: {state_path}")
     print("  Endpoints: /healthz /readyz /v1/models /v1/chat/completions")
-    app = create_app(state_path=state_path)
+
+    settings = ApiSettings.from_env()
+    if force_single_conversation is not None:
+        settings.force_single_conversation = force_single_conversation
+    if stream_chunk_size is not None:
+        settings.stream_chunk_size = stream_chunk_size
+    if receive_timeout is not None:
+        settings.receive_timeout = receive_timeout
+
+    app = create_app(state_path=state_path, settings=settings)
     uvicorn.run(app, host=host, port=port)
 
 
@@ -70,6 +87,7 @@ async def _stream_chat_completion(
     response_id: str,
     conversation_id: str,
     chunk_size: int,
+    logger: Any,
     bootstrap_response: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
     yield encode_sse_data(
@@ -81,18 +99,26 @@ async def _stream_chat_completion(
             bootstrap_response=bootstrap_response,
         )
     )
-    async for provider_chunk in chunk_iter:
-        for chunk in _chunk_text(provider_chunk, chunk_size):
-            if chunk:
-                yield encode_sse_data(
-                    build_chat_completion_chunk(
-                        model=model,
-                        response_id=response_id,
-                        delta={"content": chunk},
-                        conversation_id=conversation_id,
-                        bootstrap_response=bootstrap_response,
+    try:
+        async for provider_chunk in chunk_iter:
+            for chunk in _chunk_text(provider_chunk, chunk_size):
+                if chunk:
+                    yield encode_sse_data(
+                        build_chat_completion_chunk(
+                            model=model,
+                            response_id=response_id,
+                            delta={"content": chunk},
+                            conversation_id=conversation_id,
+                        # Only include bootstrap in the very first content chunk
+                        # to keep the payload small.
+                            bootstrap_response=bootstrap_response,
+                        )
                     )
-                )
+                bootstrap_response = None
+    except Exception:
+        logger.exception("streaming_failed")
+        return
+
     yield encode_sse_data(
         build_chat_completion_chunk(
             model=model,
@@ -172,15 +198,15 @@ def create_app(
             return error_json(400, "invalid_model", f"Unsupported model: {body.model}")
 
         compiled = compiler_fn([message.model_dump() for message in body.messages])
-        resolved = resolve_api_conversation(state_path=state_path, client_conversation_id=body.conversation_id)
-        provider_request = MuseProviderRequest(
-            prompt=compiled.user_prompt,
-            conversation_id=resolved.meta_conversation_id,
-            template_name=CHAT_TEMPLATE_NAME,
-            user_prompt=compiled.user_prompt,
+        resolved = resolve_api_conversation(
+            state_path=state_path,
+            client_conversation_id=body.conversation_id,
+            force_single_conversation=settings.force_single_conversation,
         )
+
+        main_template = resolved.template_name
         bootstrap_response_text: Optional[str] = None
-        if not body.conversation_id and compiled.bootstrap_prompt:
+        if resolved.template_name == HOME_TEMPLATE_NAME and compiled.bootstrap_prompt:
             bootstrap_response = await provider_generate_fn(
                 MuseProviderRequest(
                     prompt=compiled.bootstrap_prompt,
@@ -189,8 +215,17 @@ def create_app(
                 ),
                 state_path=state_path,
             )
+            main_template = CHAT_TEMPLATE_NAME
             if body.include_bootstrap_response:
                 bootstrap_response_text = bootstrap_response.text
+
+        provider_request = MuseProviderRequest(
+            prompt=compiled.user_prompt,
+            conversation_id=resolved.meta_conversation_id,
+            template_name=main_template,
+            user_prompt=compiled.user_prompt,
+            receive_timeout=settings.receive_timeout,
+        )
 
         if body.stream:
             response_id = f"chatcmpl-{uuid.uuid4()}"
@@ -202,6 +237,7 @@ def create_app(
                     response_id=response_id,
                     conversation_id=resolved.client_conversation_id,
                     chunk_size=settings.stream_chunk_size,
+                    logger=logger,
                     bootstrap_response=bootstrap_response_text,
                 ),
                 media_type="text/event-stream",
