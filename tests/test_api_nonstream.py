@@ -82,6 +82,46 @@ class ApiNonStreamingTests(unittest.TestCase):
             self.assertEqual(seen[1].template_name, "chat")
             self.assertEqual(seen[0].conversation_id, seen[1].conversation_id)
 
+    def test_bootstrap_request_inherits_configured_receive_timeout(self):
+        """Bootstrap call must honour ``ApiSettings.receive_timeout`` —
+        otherwise users who raise the env var to handle slow networks still
+        get the dataclass default during the bootstrap phase, causing
+        spurious bootstrap failures while the main call uses the configured
+        value.
+        """
+        from muse_spark.config import ApiSettings
+
+        seen_timeouts: list[float] = []
+
+        async def fake_provider(request, state_path=None):
+            seen_timeouts.append(request.receive_timeout)
+            return MuseProviderResponse(
+                text="ok",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        settings = ApiSettings(receive_timeout=120.0)
+        app = create_app(provider_generate_fn=fake_provider, settings=settings)
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "first turn"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        # Both bootstrap and main call must see the configured timeout, not
+        # the dataclass default.
+        self.assertEqual(len(seen_timeouts), 2)
+        self.assertTrue(
+            all(t == 120.0 for t in seen_timeouts),
+            f"Expected all calls to honour configured receive_timeout=120.0, got {seen_timeouts}",
+        )
+
     def test_chat_completions_rejects_unknown_model(self):
         async def fake_provider(request, state_path=None):
             return MuseProviderResponse(

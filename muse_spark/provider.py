@@ -30,7 +30,10 @@ class MuseProviderRequest:
     prompt: str
     conversation_id: Optional[str] = None
     template_name: str = HOME_TEMPLATE_NAME
-    receive_timeout: float = 30.0
+    # Kept in sync with ``ApiSettings.receive_timeout`` so callers that build a
+    # request without an explicit value still honour the configured idle
+    # timeout. Update both together when adjusting the platform default.
+    receive_timeout: float = 60.0
     bootstrap_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
     # When False, callers signal the conversation is already warm on Meta's

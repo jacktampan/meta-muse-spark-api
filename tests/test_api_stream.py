@@ -179,6 +179,52 @@ class ApiStreamingTests(unittest.TestCase):
         self.assertNotIn('"finish_reason":"error"', body)
         self.assertIn('data: [DONE]', body)
 
+    def test_chat_completions_stream_flushes_buffered_tail_on_stall(self):
+        """The scaffolding stripper holds back content behind a potential
+        ``<`` or ``{{`` marker. When a stall happens while content is held,
+        that buffered text must still reach the client — otherwise we'd
+        silently drop legitimate tokens while claiming graceful truncation.
+        """
+        from muse_spark.errors import ProviderStallError
+
+        async def fake_provider_stream(request, state_path=None):
+            # First chunk emits cleanly. Second chunk ends with an opener
+            # ``<`` that the stripper holds (could be a partial scaffolding
+            # tag). Third would close the tag — but the stall happens first.
+            yield "Hasil kemarin: "
+            yield "tim menang besar dengan skor <"
+            raise ProviderStallError("stalled before tag closer arrived")
+
+        async def fake_provider_generate(request, state_path=None):
+            return MuseProviderResponse(text="fake", conversation_id="m", template_name="home")
+
+        app = create_app(
+            provider_generate_fn=fake_provider_generate,
+            provider_stream_fn=fake_provider_stream,
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes()).decode("utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        # The text up to the opener must stream as content chunks.
+        self.assertIn("Hasil kemarin", body)
+        self.assertIn("tim menang besar", body)
+        # And — critically — the held tail (``... dengan skor <``) must also
+        # be flushed; before this fix the stripper buffer was silently
+        # dropped on stall, hiding the last few tokens from the client.
+        self.assertIn("dengan skor", body)
+        self.assertIn('"finish_reason":"length"', body)
+
     def test_chat_completions_stream_sets_sticky_conversation_cookie(self):
         async def fake_provider_stream(request, state_path=None):
             yield "ok"

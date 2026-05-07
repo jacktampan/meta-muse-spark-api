@@ -277,23 +277,27 @@ async def _stream_chat_completion(
     except Exception:
         logger.exception("streaming_failed")
         finish_reason = "error"
-    else:
-        # Flush any buffered tail (e.g. an in-progress tag that turned out
-        # not to be a tag, or any trailing content shorter than the buffer).
-        tail = stripper.flush()
-        if tail:
-            for chunk in _chunk_text(tail, chunk_size):
-                if chunk:
-                    yield encode_sse_data(
-                        build_chat_completion_chunk(
-                            model=model,
-                            response_id=response_id,
-                            delta={"content": chunk},
-                            conversation_id=conversation_id,
-                            bootstrap_response=bootstrap_response,
-                        )
+
+    # Always flush any buffered tail (e.g. content the stripper was holding
+    # back behind a potential ``<`` or ``{{`` marker). The held content was
+    # generated before the loop ended and should reach the client even on
+    # stall or error — otherwise we'd silently drop legitimate tokens while
+    # claiming graceful truncation. ``flush()`` sanitises orphan markers, so
+    # incomplete entity scaffolding cannot leak.
+    tail = stripper.flush()
+    if tail:
+        for chunk in _chunk_text(tail, chunk_size):
+            if chunk:
+                yield encode_sse_data(
+                    build_chat_completion_chunk(
+                        model=model,
+                        response_id=response_id,
+                        delta={"content": chunk},
+                        conversation_id=conversation_id,
+                        bootstrap_response=bootstrap_response,
                     )
-                bootstrap_response = None
+                )
+            bootstrap_response = None
 
     # Always emit a terminal chunk + [DONE] so clients don't hang. Use
     # finish_reason="error" on failure so callers can detect partial output.
@@ -410,6 +414,10 @@ def create_app(
                     prompt=compiled.bootstrap_prompt,
                     conversation_id=resolved.meta_conversation_id,
                     template_name=HOME_TEMPLATE_NAME,
+                    # Honour the configured timeout for the bootstrap call too —
+                    # otherwise users who raise MUSE_SPARK_RECEIVE_TIMEOUT for
+                    # slow networks still get the dataclass default here.
+                    receive_timeout=settings.receive_timeout,
                     needs_warmup=resolved.is_new,
                 ),
                 state_path=state_path,
