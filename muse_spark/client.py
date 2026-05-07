@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator, Callable, Iterable, Optional, Union
 
 from .errors import (
     MissingAuthError,
+    ProviderEmptyResponseError,
     ProviderProtocolError,
     ProviderStallError,
     ProviderTransportError,
@@ -655,7 +656,15 @@ async def stream_text_deltas(
                 break
 
     if not yielded:
-        raise ProviderProtocolError("Meta transport returned no usable text response.")
+        # Distinguish from generic protocol errors so the SSE pipeline can
+        # auto-recover by purging the stuck conversation mapping and
+        # retrying with a fresh meta conversation id. ``ProviderEmptyResponseError``
+        # is a subclass of ``ProviderProtocolError`` so existing handlers
+        # (and the non-streaming generate path) keep treating it as a hard
+        # protocol failure.
+        raise ProviderEmptyResponseError(
+            "Meta transport returned no usable text response."
+        )
 
 
 def _is_completion_op(op_kind: Optional[str], op_path: Optional[str], op_value: Any) -> bool:
@@ -755,7 +764,11 @@ def _resync_text(
 
 def _ensure_text_reply(text: Any) -> str:
     if not isinstance(text, str) or not text.strip():
-        raise ProviderProtocolError("Meta transport returned no usable text response.")
+        # Same stuck-conversation symptom as the streaming path; raise the
+        # typed subclass so the API layer can purge the stale mapping.
+        raise ProviderEmptyResponseError(
+            "Meta transport returned no usable text response."
+        )
     return text
 
 

@@ -12,6 +12,8 @@ from muse_spark.provider import (
     generate_from_state,
     generate_from_state_async,
     load_provider_auth,
+    purge_api_conversation,
+    resolve_api_conversation,
     stream_from_state_async,
 )
 
@@ -194,3 +196,64 @@ class MuseSparkAsyncProviderTests(unittest.IsolatedAsyncioTestCase):
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
             )
             fake_mode_switch.assert_called_once()
+
+    def test_purge_api_conversation_removes_existing_mapping_and_subsequent_resolve_creates_fresh_meta_id(self):
+        """``purge_api_conversation`` is the recovery primitive for stuck
+        conversations: after a purge, ``resolve_api_conversation`` must
+        re-create the mapping with a *new* meta conversation id rather than
+        reusing the broken one. This is the contract the SSE recovery path
+        relies on, so it gets a focused unit test in addition to the
+        end-to-end api tests.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            configure_auth(state_path, cookie_header="cookie=v", authorization="x:y")
+
+            initial = resolve_api_conversation(
+                state_path=state_path,
+                client_conversation_id="tg-42",
+                meta_conversation_id_factory=lambda: "old-meta",
+            )
+            self.assertEqual(initial.meta_conversation_id, "old-meta")
+            self.assertTrue(initial.is_new)
+
+            # Resolving again before purge should reuse the cached mapping.
+            cached = resolve_api_conversation(
+                state_path=state_path,
+                client_conversation_id="tg-42",
+                meta_conversation_id_factory=lambda: "should-not-be-used",
+            )
+            self.assertEqual(cached.meta_conversation_id, "old-meta")
+            self.assertFalse(cached.is_new)
+
+            self.assertTrue(
+                purge_api_conversation(state_path, "tg-42"),
+                "Purge must report a removal when the mapping existed",
+            )
+
+            after_purge = resolve_api_conversation(
+                state_path=state_path,
+                client_conversation_id="tg-42",
+                meta_conversation_id_factory=lambda: "new-meta",
+            )
+            self.assertEqual(after_purge.meta_conversation_id, "new-meta")
+            self.assertTrue(after_purge.is_new)
+
+            # Purging again should be a no-op and report False.
+            self.assertTrue(purge_api_conversation(state_path, "tg-42"))
+            self.assertFalse(
+                purge_api_conversation(state_path, "tg-does-not-exist"),
+                "Purge must report False when there's nothing to remove",
+            )
+
+    def test_purge_api_conversation_is_noop_for_falsy_id(self):
+        """Defensive: passing ``None`` / empty string must not blow up or
+        wipe unrelated state — the caller may pass through a missing
+        client conversation id without checking it themselves.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            configure_auth(state_path, cookie_header="cookie=v", authorization="x:y")
+
+            self.assertFalse(purge_api_conversation(state_path, None))
+            self.assertFalse(purge_api_conversation(state_path, ""))
