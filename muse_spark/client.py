@@ -15,7 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, Optional, Union
 
-from .errors import MissingAuthError, ProviderProtocolError, ProviderTransportError, ReauthRequiredError
+from .errors import (
+    MissingAuthError,
+    ProviderProtocolError,
+    ProviderStallError,
+    ProviderTransportError,
+    ReauthRequiredError,
+)
 from .logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -589,10 +595,12 @@ async def stream_text_deltas(
                 # Idle timeout. If we never yielded anything, the request
                 # didn't produce text — let the post-loop check raise. If we
                 # already saw a completion signal, this is the natural end of
-                # stream. Otherwise the response stalled mid-generation, which
-                # is what the previous version silently masked.
+                # stream. Otherwise the response stalled mid-generation: raise
+                # ``ProviderStallError`` so the SSE pipeline can surface the
+                # partial output we already streamed with finish_reason
+                # ``"length"`` (graceful truncation) instead of ``"error"``.
                 if yielded and not seen_completion_signal:
-                    raise ProviderProtocolError(
+                    raise ProviderStallError(
                         "Meta stream stalled mid-response: no data received within "
                         f"{receive_timeout:.1f}s. Output may be truncated."
                     )

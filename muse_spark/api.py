@@ -10,7 +10,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .client import CHAT_TEMPLATE_NAME, DEFAULT_STATE_PATH, HOME_TEMPLATE_NAME
 from .config import ApiSettings
-from .errors import MissingAuthError, ProviderProtocolError, ProviderTransportError, ReauthRequiredError
+from .errors import (
+    MissingAuthError,
+    ProviderProtocolError,
+    ProviderStallError,
+    ProviderTransportError,
+    ReauthRequiredError,
+)
 from .logging_utils import get_logger
 from .openai_compat import (
     build_chat_completion_chunk,
@@ -62,49 +68,127 @@ _SCAFFOLDING_TAG_PATTERN = re.compile(
 )
 _SCAFFOLDING_BARE_READY = re.compile(r"^\s*READY\.?\s*$", re.IGNORECASE)
 
+# Meta's stateful conversation responses occasionally leak internal "Inline
+# Entity" markup of the form ``{{IE_<id>}}content{{/IE_<id>}}``. Meta's web UI
+# renders these into hyperlinks, citations, and entity highlights — but they
+# surface as raw text through the OpenAI-compatible API. Examples observed in
+# production:
+#   {{IE_30000}}Paris Saint-Germain{{/IE_30000}}   (entity name — unwrap)
+#   {{IE_1}}d5cd{{/IE_1}}                          (citation hash — drop)
+#   {{IE_3}}post-862616848552664650850{{/IE_3}}    (citation post-id — drop)
+#   {{IE_2}}c3ce{{/IE_2}}0b57{{/IE_2}}             (orphan close — drop)
+_INLINE_ENTITY_PAIR = re.compile(
+    r"\{\{IE_([\w-]+)\}\}(.*?)\{\{/IE_\1\}\}",
+    re.DOTALL,
+)
+_INLINE_ENTITY_OPENER = re.compile(r"\{\{IE_([\w-]+)\}\}")
+_INLINE_ENTITY_ORPHAN = re.compile(r"\{\{/?IE_[\w-]+\}\}")
+# Pure lowercase hex (≥4 chars) or ``post-…`` IDs are citation references and
+# carry no user-facing meaning — drop the entire pair. Other content (e.g.
+# proper-noun entity names like ``Paris Saint-Germain``) is unwrapped and kept.
+_INLINE_ENTITY_CITATION_LIKE = re.compile(r"^(?:[a-f0-9]{4,}|post-[\w-]+)$")
+
+
+def _replace_ie_pair(match: re.Match[str]) -> str:
+    content = match.group(2)
+    if not content or _INLINE_ENTITY_CITATION_LIKE.match(content):
+        return ""
+    return content
+
+
+def _strip_inline_entities(text: str) -> str:
+    """Remove Meta's internal inline-entity markup from assistant output.
+
+    See ``_INLINE_ENTITY_PAIR`` above for examples. Pairs whose content looks
+    like a citation reference are dropped entirely; pairs with human-readable
+    content are unwrapped (content kept). Orphan tags (open without close, or
+    close without open) are stripped.
+    """
+    if "{{" not in text:
+        return text
+    # Apply pair replacement until stable to handle the rare case where Meta
+    # emits nested entity markers (inner pair drops first, outer pair drops
+    # on the next iteration once it becomes a flat run of text).
+    while True:
+        new_text = _INLINE_ENTITY_PAIR.sub(_replace_ie_pair, text)
+        if new_text == text:
+            break
+        text = new_text
+    return _INLINE_ENTITY_ORPHAN.sub("", text)
+
 
 def _clean_assistant_text(text: Optional[str]) -> str:
     """Strip stateful-turn scaffolding tags that occasionally leak into output."""
     if not text:
         return ""
     cleaned = _SCAFFOLDING_TAG_PATTERN.sub("", text)
+    cleaned = _strip_inline_entities(cleaned)
     if _SCAFFOLDING_BARE_READY.match(cleaned):
         return ""
     return cleaned
 
 
 class _ScaffoldingStripper:
-    """Streaming-safe stripper for scaffolding tags split across SSE chunks.
+    """Streaming-safe stripper for scaffolding tags and inline-entity markup.
 
-    Holds back only when a chunk ends with what could be a partial tag opener
-    (``<`` without a matching ``>``). All other content is emitted immediately,
-    preserving streaming UX.
+    Holds back only when a chunk ends with what could be a partial marker —
+    ``<`` without ``>``, ``{{`` without ``}}``, or a complete ``{{IE_X}}``
+    opener whose matching ``{{/IE_X}}`` close hasn't arrived yet. All other
+    content is emitted immediately, preserving streaming UX.
     """
 
     def __init__(self) -> None:
         self._buffer = ""
 
+    @staticmethod
+    def _clean(text: str) -> str:
+        text = _SCAFFOLDING_TAG_PATTERN.sub("", text)
+        return _strip_inline_entities(text)
+
+    @staticmethod
+    def _hold_position(text: str) -> int:
+        """Earliest index from which content might be incomplete markup.
+
+        Returns ``-1`` when the entire buffer is safe to emit.
+        """
+        candidates: list[int] = []
+
+        # Partial scaffolding tag at the end (``<`` with no ``>`` after it).
+        last_lt = text.rfind("<")
+        if last_lt != -1 and ">" not in text[last_lt:]:
+            candidates.append(last_lt)
+
+        # Partial brace pair at the end (``{{`` with no ``}}`` after it).
+        last_brace = text.rfind("{{")
+        if last_brace != -1 and "}}" not in text[last_brace:]:
+            candidates.append(last_brace)
+
+        # Complete ``{{IE_X}}`` opener whose matching close hasn't arrived.
+        # Walk earliest-first; first unmatched opener is enough since holding
+        # there suspends every later opener too.
+        for match in _INLINE_ENTITY_OPENER.finditer(text):
+            needle = "{{/IE_" + match.group(1) + "}}"
+            if needle not in text[match.end():]:
+                candidates.append(match.start())
+                break
+
+        return min(candidates) if candidates else -1
+
     def feed(self, chunk: str) -> str:
         if not chunk:
             return ""
         self._buffer += chunk
-        last_open = self._buffer.rfind("<")
-        if last_open == -1:
-            emit = self._buffer
+        hold = self._hold_position(self._buffer)
+        if hold == -1:
+            emit = self._clean(self._buffer)
             self._buffer = ""
             return emit
-        suffix = self._buffer[last_open:]
-        if ">" in suffix:
-            emit = _SCAFFOLDING_TAG_PATTERN.sub("", self._buffer)
-            self._buffer = ""
-            return emit
-        # Partial tag at end — hold from the opener onward, emit the rest.
-        emit = _SCAFFOLDING_TAG_PATTERN.sub("", self._buffer[:last_open])
-        self._buffer = suffix
+        emit = self._clean(self._buffer[:hold])
+        self._buffer = self._buffer[hold:]
         return emit
 
     def flush(self) -> str:
-        cleaned = _SCAFFOLDING_TAG_PATTERN.sub("", self._buffer)
+        cleaned = self._clean(self._buffer)
         self._buffer = ""
         if _SCAFFOLDING_BARE_READY.match(cleaned):
             return ""
@@ -183,26 +267,37 @@ async def _stream_chat_completion(
                         )
                     )
                 bootstrap_response = None
+    except ProviderStallError as exc:
+        # Mid-response stall: we already streamed real content to the client.
+        # Surface it as a graceful truncation (``finish_reason="length"``)
+        # rather than an error, so OpenAI-compatible clients keep the partial
+        # output and don't raise on the caller side.
+        logger.warning("streaming_stalled: %s", exc)
+        finish_reason = "length"
     except Exception:
         logger.exception("streaming_failed")
         finish_reason = "error"
-    else:
-        # Flush any buffered tail (e.g. an in-progress tag that turned out
-        # not to be a tag, or any trailing content shorter than the buffer).
-        tail = stripper.flush()
-        if tail:
-            for chunk in _chunk_text(tail, chunk_size):
-                if chunk:
-                    yield encode_sse_data(
-                        build_chat_completion_chunk(
-                            model=model,
-                            response_id=response_id,
-                            delta={"content": chunk},
-                            conversation_id=conversation_id,
-                            bootstrap_response=bootstrap_response,
-                        )
+
+    # Always flush any buffered tail (e.g. content the stripper was holding
+    # back behind a potential ``<`` or ``{{`` marker). The held content was
+    # generated before the loop ended and should reach the client even on
+    # stall or error — otherwise we'd silently drop legitimate tokens while
+    # claiming graceful truncation. ``flush()`` sanitises orphan markers, so
+    # incomplete entity scaffolding cannot leak.
+    tail = stripper.flush()
+    if tail:
+        for chunk in _chunk_text(tail, chunk_size):
+            if chunk:
+                yield encode_sse_data(
+                    build_chat_completion_chunk(
+                        model=model,
+                        response_id=response_id,
+                        delta={"content": chunk},
+                        conversation_id=conversation_id,
+                        bootstrap_response=bootstrap_response,
                     )
-                bootstrap_response = None
+                )
+            bootstrap_response = None
 
     # Always emit a terminal chunk + [DONE] so clients don't hang. Use
     # finish_reason="error" on failure so callers can detect partial output.
@@ -319,6 +414,10 @@ def create_app(
                     prompt=compiled.bootstrap_prompt,
                     conversation_id=resolved.meta_conversation_id,
                     template_name=HOME_TEMPLATE_NAME,
+                    # Honour the configured timeout for the bootstrap call too —
+                    # otherwise users who raise MUSE_SPARK_RECEIVE_TIMEOUT for
+                    # slow networks still get the dataclass default here.
+                    receive_timeout=settings.receive_timeout,
                     needs_warmup=resolved.is_new,
                 ),
                 state_path=state_path,
