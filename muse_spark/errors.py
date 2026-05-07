@@ -19,3 +19,13 @@ class ProviderTransportError(MuseSparkError):
 
 class ProviderProtocolError(MuseSparkError):
     """Meta transport succeeded but returned unusable or unexpected data."""
+
+
+class ProviderStallError(ProviderProtocolError):
+    """Meta stream went idle mid-response after emitting some output.
+
+    Distinguished from ``ProviderProtocolError`` so the SSE pipeline can
+    surface partial content with ``finish_reason="length"`` (truncation) rather
+    than ``"error"``. Clients that already received tokens get a graceful end
+    of stream instead of having the request appear to fail outright.
+    """

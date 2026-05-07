@@ -10,7 +10,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .client import CHAT_TEMPLATE_NAME, DEFAULT_STATE_PATH, HOME_TEMPLATE_NAME
 from .config import ApiSettings
-from .errors import MissingAuthError, ProviderProtocolError, ProviderTransportError, ReauthRequiredError
+from .errors import (
+    MissingAuthError,
+    ProviderProtocolError,
+    ProviderStallError,
+    ProviderTransportError,
+    ReauthRequiredError,
+)
 from .logging_utils import get_logger
 from .openai_compat import (
     build_chat_completion_chunk,
@@ -261,6 +267,13 @@ async def _stream_chat_completion(
                         )
                     )
                 bootstrap_response = None
+    except ProviderStallError as exc:
+        # Mid-response stall: we already streamed real content to the client.
+        # Surface it as a graceful truncation (``finish_reason="length"``)
+        # rather than an error, so OpenAI-compatible clients keep the partial
+        # output and don't raise on the caller side.
+        logger.warning("streaming_stalled: %s", exc)
+        finish_reason = "length"
     except Exception:
         logger.exception("streaming_failed")
         finish_reason = "error"

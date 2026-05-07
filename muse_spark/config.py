@@ -11,9 +11,11 @@ class ApiSettings:
     stream_chunk_size: int = 0
     debug_frame_dumps: bool = False
     force_single_conversation: bool = False
-    # Idle timeout per WebSocket recv. Bumped from 10s to 30s because Meta can
-    # pause mid-generation and a too-short timeout silently truncates output.
-    receive_timeout: float = 30.0
+    # Idle timeout per WebSocket recv. Bumped to 60s because Meta can pause
+    # for tens of seconds mid-generation under load — a 30s ceiling caused
+    # legitimate slow responses to fail the stall-detection guard. Override
+    # via ``MUSE_SPARK_RECEIVE_TIMEOUT`` if your network/load tolerates less.
+    receive_timeout: float = 60.0
 
     @classmethod
     def from_env(cls) -> "ApiSettings":
@@ -23,5 +25,5 @@ class ApiSettings:
             stream_chunk_size=int(os.getenv("MUSE_SPARK_STREAM_CHUNK_SIZE", "0")),
             debug_frame_dumps=os.getenv("MUSE_SPARK_DEBUG_FRAME_DUMPS", "0").lower() in {"1", "true", "yes", "on"},
             force_single_conversation=os.getenv("MUSE_SPARK_FORCE_SINGLE_CONVERSATION", "0").lower() in {"1", "true", "yes", "on"},
-            receive_timeout=float(os.getenv("MUSE_SPARK_RECEIVE_TIMEOUT", "30.0")),
+            receive_timeout=float(os.getenv("MUSE_SPARK_RECEIVE_TIMEOUT", "60.0")),
         )

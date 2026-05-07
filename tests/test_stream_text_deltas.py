@@ -14,7 +14,7 @@ from typing import Any
 from unittest.mock import patch
 
 from muse_spark.client import stream_text_deltas
-from muse_spark.errors import ProviderProtocolError
+from muse_spark.errors import ProviderProtocolError, ProviderStallError
 
 
 def _frame(event: dict[str, Any]) -> bytes:
@@ -80,10 +80,11 @@ async def _collect(prompt: str, ws: _FakeWebSocket, timeout: float = 0.05) -> li
 
 
 class StreamTextDeltasTests(unittest.TestCase):
-    def test_stalled_after_yield_raises_protocol_error(self):
-        """Previously the loop break-d silently and clients saw truncated
-        output with a phony ``[DONE]``. Now we raise so the API layer can
-        emit ``finish_reason="error"`` and clients know output is partial.
+    def test_stalled_after_yield_raises_stall_error(self):
+        """Mid-response stall raises ``ProviderStallError`` (a subclass of
+        ``ProviderProtocolError``). The dedicated subclass lets the SSE
+        pipeline surface partial output with ``finish_reason="length"``
+        instead of treating the request as a hard error.
         """
         ws = _FakeWebSocket(
             recv_script=[
@@ -100,8 +101,11 @@ class StreamTextDeltasTests(unittest.TestCase):
                 "STALL",
             ]
         )
-        with self.assertRaises(ProviderProtocolError) as ctx:
+        with self.assertRaises(ProviderStallError) as ctx:
             asyncio.run(_collect("hi", ws, timeout=0.05))
+        # Subclass relationship is part of the contract — existing handlers
+        # that catch ``ProviderProtocolError`` keep working.
+        self.assertIsInstance(ctx.exception, ProviderProtocolError)
         self.assertIn("stalled", str(ctx.exception).lower())
 
     def test_completion_signal_exits_loop_promptly(self):

@@ -105,7 +105,7 @@ API settings from env
 - `MUSE_SPARK_STREAM_CHUNK_SIZE` default: `0` (0 to disable artificial chunking)
 - `MUSE_SPARK_DEBUG_FRAME_DUMPS` default: `0`
 - `MUSE_SPARK_FORCE_SINGLE_CONVERSATION` default: `0` (Set to 1 to stick to one conversation)
-- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `30.0`
+- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `60.0`
 
 Sticky conversation for agent frameworks
 Most OpenAI-compatible client libraries (LangChain, LlamaIndex, the OpenAI SDK,
@@ -125,7 +125,7 @@ Notes
 - Use `--single-conversation` if you want all requests to share the exact same history (useful for simple agents).
 - New conversations use a hidden bootstrap turn, then the real user turn.
 - Follow ups reuse the same conversation_id and send only the latest user message; the per-request `warmup_conversation` and `mode_switch` GraphQL round-trips are skipped to halve follow-up latency.
-- If a stream stalls mid-response (no data within `MUSE_SPARK_RECEIVE_TIMEOUT`) the API returns a final SSE chunk with `finish_reason="error"` and `[DONE]` instead of silently truncating.
+- If a stream stalls mid-response (no data within `MUSE_SPARK_RECEIVE_TIMEOUT`) and tokens were already streamed, the API surfaces partial output with `finish_reason="length"` (graceful truncation). If nothing was streamed yet, it returns `finish_reason="error"`. Either way a terminal SSE chunk + `[DONE]` is always emitted, so OpenAI-compatible clients never hang.
 - The stateless transcript compiler is removed; stateful XML turn planning is the only chat path.
 - The CLI stores known conversations locally in `~/.muse_spark/state.json`.
 - If auth expires, rerun `auth set` with fresh Charles values.
