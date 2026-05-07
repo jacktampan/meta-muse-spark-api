@@ -226,7 +226,8 @@ def run_api_server(
     uvicorn.run(app, host=host, port=port)
 
 
-RetryFactory = Callable[[], Awaitable[Optional[AsyncIterator[str]]]]
+RetryResult = tuple[AsyncIterator[str], Optional[str]]
+RetryFactory = Callable[[], Awaitable[Optional[RetryResult]]]
 
 
 async def _stream_chat_completion(
@@ -293,12 +294,22 @@ async def _stream_chat_completion(
                     "streaming_empty_response_retry: %s", exc
                 )
                 replacement = await retry_factory()
-                # Make sure we only retry once even if subsequent attempts
-                # return more empties — retry_factory itself can also enforce
-                # this by returning None on the second call.
+                # Bound retries to one attempt regardless of what
+                # ``retry_factory`` does next.
                 retry_factory = None
                 if replacement is not None:
-                    chunk_iter = replacement
+                    chunk_iter, recovered_bootstrap = replacement
+                    # The role chunk was emitted before recovery, so the
+                    # bootstrap text from the *first* attempt is already on
+                    # the wire (typically ``None`` since recovery only fires
+                    # on existing follow-up conversations). The retry's
+                    # fresh conversation runs HOME bootstrap and produces a
+                    # new bootstrap text — adopt it so the next emitted
+                    # content chunk carries it. Without this, clients that
+                    # opted into ``include_bootstrap_response`` would
+                    # silently lose the recovery's bootstrap text.
+                    if recovered_bootstrap is not None:
+                        bootstrap_response = recovered_bootstrap
                     continue
             logger.exception("streaming_failed")
             finish_reason = "error"
@@ -487,10 +498,16 @@ def create_app(
 
             Called when Meta returns an empty stream for an existing
             conversation — the symptom of the conversation being broken on
-            Meta's backend after a previous mid-response stall. Returns the
-            new (resolved, request, bootstrap_text) tuple, or ``None`` when
-            recovery isn't applicable (brand-new conversation that just
-            failed, or no mapping to purge).
+            Meta's backend after a previous mid-response stall. Returns a
+            ``(new_resolved, new_request, new_bootstrap_text)`` tuple, or
+            ``None`` when recovery isn't applicable (brand-new conversation
+            that just failed, or no mapping to purge).
+
+            The fresh resolved conversation always lands on the HOME
+            template, so ``_prepare_attempt`` will run a bootstrap call
+            whose text must be propagated to the response — discarding it
+            silently breaks ``include_bootstrap_response`` for clients that
+            rely on it.
             """
             if resolved.is_new:
                 return None
@@ -501,8 +518,8 @@ def create_app(
                 client_conversation_id=sticky_id,
                 force_single_conversation=settings.force_single_conversation,
             )
-            new_request, _new_bootstrap_text = await _prepare_attempt(new_resolved)
-            return new_resolved, new_request
+            new_request, new_bootstrap_text = await _prepare_attempt(new_resolved)
+            return new_resolved, new_request, new_bootstrap_text
 
         if body.stream:
             response_id = f"chatcmpl-{uuid.uuid4()}"
@@ -512,8 +529,15 @@ def create_app(
                 recovery = await _recover_stuck_conversation()
                 if recovery is None:
                     return None
-                _new_resolved, new_request = recovery
-                return provider_stream_fn(new_request, state_path=state_path)
+                _new_resolved, new_request, new_bootstrap_text = recovery
+                # Returning a tuple ``(chunk_iter, bootstrap_text)`` lets
+                # ``_stream_chat_completion`` re-inject the recovered
+                # bootstrap text into the next content chunk; the original
+                # role chunk was emitted before recovery and can't carry it.
+                return (
+                    provider_stream_fn(new_request, state_path=state_path),
+                    new_bootstrap_text,
+                )
 
             response = StreamingResponse(
                 _stream_chat_completion(
@@ -546,7 +570,12 @@ def create_app(
             if recovery is None:
                 raise
             logger.warning("non_streaming_empty_response_retry: %s", exc)
-            _new_resolved, new_request = recovery
+            _new_resolved, new_request, new_bootstrap_text = recovery
+            # Adopt the recovery's bootstrap text so ``include_bootstrap_response``
+            # surfaces the freshly bootstrapped greeting instead of the stale
+            # ``None`` from the stuck-conversation attempt that didn't bootstrap.
+            if new_bootstrap_text is not None:
+                bootstrap_response_text = new_bootstrap_text
             provider_response = await provider_generate_fn(
                 new_request, state_path=state_path
             )

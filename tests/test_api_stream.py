@@ -321,6 +321,108 @@ class ApiStreamingTests(unittest.TestCase):
         self.assertIn('"finish_reason":"stop"', body)
         self.assertNotIn('"finish_reason":"error"', body)
 
+    def test_chat_completions_stream_recovery_propagates_bootstrap_response(self):
+        """Streaming counterpart to the non-streaming bootstrap-propagation
+        test: when recovery fires on a stuck conversation, the retry runs
+        a fresh HOME-template bootstrap. If the client opted into
+        ``include_bootstrap_response``, that recovered bootstrap text must
+        end up in a content chunk after the retry — without it, the field
+        is silently dropped and the client never sees the fresh greeting
+        (regression for Devin Review BUG_pr-review-job-…_0001).
+        """
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from muse_spark.client import save_state
+        from muse_spark.errors import ProviderEmptyResponseError
+
+        async def fake_provider_stream(request, state_path=None):
+            if request.conversation_id == "stuck-meta-id":
+                raise ProviderEmptyResponseError(
+                    "Meta transport returned no usable text response."
+                )
+            for token in ("real ", "answer"):
+                yield token
+
+        async def fake_provider_generate(request, state_path=None):
+            # Bootstrap call on the recovered fresh conv. Use a sentinel
+            # that's easy to spot in the SSE body.
+            return MuseProviderResponse(
+                text="HELLO_RECOVERED_BOOTSTRAP",
+                conversation_id=request.conversation_id,
+                template_name="home",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            save_state(
+                state_path,
+                {
+                    "auth": {
+                        "cookie_header": "x",
+                        "authorization": "Bearer x",
+                        "mode": "fast",
+                        "user_agent": "test",
+                    },
+                    "api_conversations": {
+                        "tg-77": {
+                            "meta_conversation_id": "stuck-meta-id",
+                            "created_at": 1,
+                            "last_used_at": 1,
+                        }
+                    },
+                },
+            )
+
+            app = create_app(
+                provider_generate_fn=fake_provider_generate,
+                provider_stream_fn=fake_provider_stream,
+                state_path=state_path,
+            )
+            client = TestClient(app, raise_server_exceptions=False)
+
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers={"x-conversation-id": "tg-77"},
+                json={
+                    "model": "meta/muse-spark",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                    "include_bootstrap_response": True,
+                },
+            ) as response:
+                body = b"".join(response.iter_bytes()).decode("utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        # Sanity: recovery worked — real content reached the client.
+        self.assertIn("real", body)
+        self.assertIn("answer", body)
+        self.assertIn('"finish_reason":"stop"', body)
+
+        # Walk the SSE chunks and confirm at least one *content* chunk
+        # carries the recovered bootstrap text. Parsing the JSON rather
+        # than substring-matching avoids accidental matches against the
+        # sentinel appearing in a different field name later.
+        bootstrap_chunks = []
+        for line in body.splitlines():
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: "):]
+            if data.strip() == "[DONE]":
+                continue
+            try:
+                obj = _json.loads(data)
+            except _json.JSONDecodeError:
+                continue
+            if obj.get("bootstrap_response") == "HELLO_RECOVERED_BOOTSTRAP":
+                bootstrap_chunks.append(obj)
+
+        self.assertTrue(
+            bootstrap_chunks,
+            "Expected at least one chunk to carry the recovery's bootstrap_response",
+        )
+
     def test_chat_completions_stream_does_not_retry_brand_new_conversation(self):
         """If the very first request to a fresh conversation gets an empty
         response, retrying with a different conversation id won't help —
