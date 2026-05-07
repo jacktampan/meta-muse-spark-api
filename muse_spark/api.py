@@ -206,6 +206,7 @@ def run_api_server(
     force_single_conversation: Optional[bool] = None,
     stream_chunk_size: Optional[int] = None,
     receive_timeout: Optional[float] = None,
+    first_byte_timeout: Optional[float] = None,
 ) -> None:
     import uvicorn
 
@@ -221,6 +222,8 @@ def run_api_server(
         settings.stream_chunk_size = stream_chunk_size
     if receive_timeout is not None:
         settings.receive_timeout = receive_timeout
+    if first_byte_timeout is not None:
+        settings.first_byte_timeout = first_byte_timeout
 
     app = create_app(state_path=state_path, settings=settings)
     uvicorn.run(app, host=host, port=port)
@@ -470,6 +473,7 @@ def create_app(
                         # otherwise users who raise MUSE_SPARK_RECEIVE_TIMEOUT for
                         # slow networks still get the dataclass default here.
                         receive_timeout=settings.receive_timeout,
+                        first_byte_timeout=settings.first_byte_timeout,
                         needs_warmup=active_resolved.is_new,
                     ),
                     state_path=state_path,
@@ -485,6 +489,7 @@ def create_app(
                 template_name=main_template,
                 user_prompt=compiled.user_prompt,
                 receive_timeout=settings.receive_timeout,
+                first_byte_timeout=settings.first_byte_timeout,
                 # Skip warmup for follow-ups (conversation already exists on Meta)
                 # and for the second call in a bootstrap round (just warmed).
                 needs_warmup=active_resolved.is_new and not bootstrap_already_warmed,

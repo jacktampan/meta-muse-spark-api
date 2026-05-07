@@ -281,6 +281,7 @@ class MuseSparkClientTests(unittest.TestCase):
                 force_single_conversation=None,
                 stream_chunk_size=None,
                 receive_timeout=None,
+                first_byte_timeout=None,
             )
 
     def test_main_serve_forwards_explicit_tuning_flags_when_provided(self):
@@ -314,7 +315,32 @@ class MuseSparkClientTests(unittest.TestCase):
                 force_single_conversation=True,
                 stream_chunk_size=120,
                 receive_timeout=45.0,
+                first_byte_timeout=None,
             )
+
+    def test_main_serve_forwards_first_byte_timeout_flag(self):
+        """``--first-byte-timeout`` must be plumbed through to
+        ``run_api_server`` so operators can override the default 20s
+        ceiling without touching env vars (useful for production hot-fix
+        when the optimisation needs tightening or disabling)."""
+        from muse_spark.client import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            with patch("muse_spark.api.run_api_server") as fake_run:
+                exit_code = main(
+                    [
+                        "--state-path",
+                        str(state_path),
+                        "serve",
+                        "--first-byte-timeout",
+                        "10.0",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            kwargs = fake_run.call_args.kwargs
+            self.assertEqual(kwargs.get("first_byte_timeout"), 10.0)
 
     def test_run_api_server_prints_startup_banner(self):
         from muse_spark.api import run_api_server

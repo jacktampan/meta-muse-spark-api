@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 from fastapi.testclient import TestClient
 
 from muse_spark.api import create_app
@@ -121,6 +122,43 @@ class ApiNonStreamingTests(unittest.TestCase):
             all(t == 120.0 for t in seen_timeouts),
             f"Expected all calls to honour configured receive_timeout=120.0, got {seen_timeouts}",
         )
+
+    def test_bootstrap_and_main_request_inherit_configured_first_byte_timeout(self):
+        """``ApiSettings.first_byte_timeout`` must propagate to *both* the
+        bootstrap call and the main call. Otherwise a freshly bootstrapped
+        conversation that gets stuck on the bootstrap turn would still wait
+        the full ``receive_timeout`` before recovery triggers, defeating the
+        whole point of the optimisation on the very first request.
+        """
+        from muse_spark.config import ApiSettings
+
+        seen: list[tuple[Optional[float], Optional[float]]] = []
+
+        async def fake_provider(request, state_path=None):
+            seen.append((request.receive_timeout, request.first_byte_timeout))
+            return MuseProviderResponse(
+                text="ok",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        settings = ApiSettings(receive_timeout=120.0, first_byte_timeout=15.0)
+        app = create_app(provider_generate_fn=fake_provider, settings=settings)
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "meta/muse-spark",
+                "messages": [{"role": "user", "content": "first turn"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(seen), 2)
+        for receive_t, first_byte_t in seen:
+            self.assertEqual(receive_t, 120.0)
+            self.assertEqual(first_byte_t, 15.0)
 
     def test_chat_completions_rejects_unknown_model(self):
         async def fake_provider(request, state_path=None):
