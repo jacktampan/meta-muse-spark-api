@@ -78,7 +78,7 @@ Force a single persistent conversation for AI agents:
 `uv run muse-spark serve --single-conversation`
 
 Adjust streaming and timeouts:
-`uv run muse-spark serve --chunk-size 0 --timeout 15.0`
+`uv run muse-spark serve --chunk-size 0 --timeout 60.0 --first-byte-timeout 20.0`
 
 Health check:
 `curl http://127.0.0.1:8000/healthz`
@@ -105,7 +105,8 @@ API settings from env
 - `MUSE_SPARK_STREAM_CHUNK_SIZE` default: `0` (0 to disable artificial chunking)
 - `MUSE_SPARK_DEBUG_FRAME_DUMPS` default: `0`
 - `MUSE_SPARK_FORCE_SINGLE_CONVERSATION` default: `0` (Set to 1 to stick to one conversation)
-- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `60.0`
+- `MUSE_SPARK_RECEIVE_TIMEOUT` default: `60.0` (idle ceiling between tokens once streaming has started)
+- `MUSE_SPARK_FIRST_BYTE_TIMEOUT` default: `20.0` (tighter idle ceiling *before* the first token; lets the SSE pipeline trigger stuck-conversation recovery sooner. Set to 0 or to `MUSE_SPARK_RECEIVE_TIMEOUT` to disable.)
 
 Sticky conversation for agent frameworks
 Most OpenAI-compatible client libraries (LangChain, LlamaIndex, the OpenAI SDK,

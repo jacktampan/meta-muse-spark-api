@@ -550,6 +550,7 @@ async def stream_text_deltas(
     user_agent: str = DEFAULT_USER_AGENT,
     switch_mode_first: bool = False,
     receive_timeout: float = 30.0,
+    first_byte_timeout: Optional[float] = None,
     template_name: str = HOME_TEMPLATE_NAME,
 ) -> AsyncIterator[str]:
     try:
@@ -590,8 +591,29 @@ async def stream_text_deltas(
             )
         )
         while True:
+            # Use a tighter idle window before any token has streamed: a
+            # healthy Meta turn responds within seconds, so a long pre-first-
+            # byte gap is almost always a stuck-conversation symptom (post-
+            # stall, throttling, or backend wedge). Failing fast here lets the
+            # SSE pipeline trigger recovery sooner instead of holding the
+            # client connection open for the full ``receive_timeout`` (which
+            # exists to tolerate slow generation *between* tokens, a
+            # different failure mode). Caller can opt out by passing
+            # ``first_byte_timeout=None`` (or the same value as
+            # ``receive_timeout``).
+            if (
+                not yielded
+                and first_byte_timeout is not None
+                and first_byte_timeout > 0
+                and first_byte_timeout < receive_timeout
+            ):
+                effective_timeout = first_byte_timeout
+            else:
+                effective_timeout = receive_timeout
             try:
-                payload = await asyncio.wait_for(websocket.recv(), timeout=receive_timeout)
+                payload = await asyncio.wait_for(
+                    websocket.recv(), timeout=effective_timeout
+                )
             except asyncio.TimeoutError:
                 # Idle timeout. If we never yielded anything, the request
                 # didn't produce text — let the post-loop check raise. If we
@@ -603,7 +625,7 @@ async def stream_text_deltas(
                 if yielded and not seen_completion_signal:
                     raise ProviderStallError(
                         "Meta stream stalled mid-response: no data received within "
-                        f"{receive_timeout:.1f}s. Output may be truncated."
+                        f"{effective_timeout:.1f}s. Output may be truncated."
                     )
                 break
             except ConnectionClosed:
@@ -869,6 +891,7 @@ async def generate_text(
     user_agent: str = DEFAULT_USER_AGENT,
     switch_mode_first: bool = False,
     receive_timeout: float = 30.0,
+    first_byte_timeout: Optional[float] = None,
     template_name: str = HOME_TEMPLATE_NAME,
 ) -> str:
     parts: list[str] = []
@@ -881,6 +904,7 @@ async def generate_text(
         user_agent=user_agent,
         switch_mode_first=switch_mode_first,
         receive_timeout=receive_timeout,
+        first_byte_timeout=first_byte_timeout,
         template_name=template_name,
     ):
         parts.append(chunk)
@@ -1030,6 +1054,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Receive timeout in seconds. When omitted, MUSE_SPARK_RECEIVE_TIMEOUT env var is honored.",
     )
+    serve_parser.add_argument(
+        "--first-byte-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Pre-first-byte idle timeout in seconds (default 20s). Stuck-conversation "
+            "recovery triggers this much faster than waiting for --timeout. Set equal to "
+            "or above --timeout to disable. When omitted, MUSE_SPARK_FIRST_BYTE_TIMEOUT "
+            "env var is honored."
+        ),
+    )
 
     return parser
 
@@ -1102,6 +1137,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             force_single_conversation=args.single_conversation,
             stream_chunk_size=args.chunk_size,
             receive_timeout=args.timeout,
+            first_byte_timeout=args.first_byte_timeout,
         )
         return 0
 

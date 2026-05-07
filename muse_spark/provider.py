@@ -34,6 +34,10 @@ class MuseProviderRequest:
     # request without an explicit value still honour the configured idle
     # timeout. Update both together when adjusting the platform default.
     receive_timeout: float = 60.0
+    # Optional pre-first-byte idle ceiling — see ``ApiSettings.first_byte_timeout``.
+    # ``None`` (or any value >= ``receive_timeout``) disables the optimisation
+    # and falls back to the existing single-timeout behaviour.
+    first_byte_timeout: Optional[float] = 20.0
     bootstrap_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
     # When False, callers signal the conversation is already warm on Meta's
@@ -177,6 +181,7 @@ async def generate_from_state_async(
             user_agent=auth["user_agent"],
             switch_mode_first=False,
             receive_timeout=request.receive_timeout,
+            first_byte_timeout=request.first_byte_timeout,
             template_name=HOME_TEMPLATE_NAME,
         )
     text = await generate_fn(
@@ -188,6 +193,7 @@ async def generate_from_state_async(
         user_agent=auth["user_agent"],
         switch_mode_first=False,
         receive_timeout=request.receive_timeout,
+        first_byte_timeout=request.first_byte_timeout,
         template_name=request.template_name,
     )
 
@@ -237,6 +243,7 @@ async def stream_from_state_async(
             user_agent=auth["user_agent"],
             switch_mode_first=False,
             receive_timeout=request.receive_timeout,
+            first_byte_timeout=request.first_byte_timeout,
             template_name=HOME_TEMPLATE_NAME,
         ):
             _ = chunk
@@ -249,6 +256,7 @@ async def stream_from_state_async(
         user_agent=auth["user_agent"],
         switch_mode_first=False,
         receive_timeout=request.receive_timeout,
+        first_byte_timeout=request.first_byte_timeout,
         template_name=request.template_name,
     ):
         yield chunk

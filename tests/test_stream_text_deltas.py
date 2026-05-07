@@ -14,7 +14,11 @@ from typing import Any
 from unittest.mock import patch
 
 from muse_spark.client import stream_text_deltas
-from muse_spark.errors import ProviderProtocolError, ProviderStallError
+from muse_spark.errors import (
+    ProviderEmptyResponseError,
+    ProviderProtocolError,
+    ProviderStallError,
+)
 
 
 def _frame(event: dict[str, Any]) -> bytes:
@@ -133,6 +137,111 @@ class StreamTextDeltasTests(unittest.TestCase):
         )
         chunks = asyncio.run(_collect("hi", ws, timeout=0.05))
         self.assertEqual(chunks, ["done"])
+
+    def test_first_byte_timeout_fires_before_receive_timeout_when_no_data(self):
+        """When Meta is silent before the first patch — the typical
+        stuck-conversation symptom — ``stream_text_deltas`` must give up
+        after ``first_byte_timeout`` instead of waiting the full
+        ``receive_timeout``. The SSE recovery path keys off the resulting
+        ``ProviderEmptyResponseError`` to purge + retry, so faster detection
+        directly translates into shorter user-facing latency.
+        """
+        ws = _FakeWebSocket(recv_script=["STALL"])
+
+        async def _run() -> None:
+            with patch("websockets.connect", _patched_connect(ws)):
+                start = asyncio.get_event_loop().time()
+                with self.assertRaises(ProviderEmptyResponseError):
+                    async for _ in stream_text_deltas(
+                        prompt="hi",
+                        conversation_id="00000000-0000-0000-0000-000000000000",
+                        authorization="Bearer fake",
+                        cookie_header="cookie=fake",
+                        receive_timeout=10.0,        # would dominate without the optimisation
+                        first_byte_timeout=0.05,     # tight pre-first-byte ceiling
+                    ):
+                        pass
+                elapsed = asyncio.get_event_loop().time() - start
+                # Comfortably below ``receive_timeout`` (10s) — sanity check
+                # that the smaller window actually drove the deadline.
+                self.assertLess(elapsed, 1.0)
+
+        asyncio.run(_run())
+
+    def test_first_byte_timeout_does_not_apply_after_first_token(self):
+        """Once Meta has streamed at least one token, between-tokens silence
+        is *generation* slowness — not a stuck-conversation symptom — and the
+        full ``receive_timeout`` window must apply so we surface a graceful
+        ``ProviderStallError`` (→ ``finish_reason="length"``) instead of
+        misclassifying it as an empty-response failure.
+        """
+        ws = _FakeWebSocket(
+            recv_script=[
+                _frame({
+                    "type": "patch",
+                    "operations": [
+                        {
+                            "op": "delta",
+                            "path": "/sections/0/view_model/primitive/text",
+                            "value": "Hi",
+                        }
+                    ],
+                }),
+                "STALL",  # mid-response stall — should raise stall error after
+                          # ``receive_timeout`` (NOT after ``first_byte_timeout``).
+            ]
+        )
+
+        async def _run() -> None:
+            with patch("websockets.connect", _patched_connect(ws)):
+                with self.assertRaises(ProviderStallError) as ctx:
+                    async for _ in stream_text_deltas(
+                        prompt="hi",
+                        conversation_id="00000000-0000-0000-0000-000000000000",
+                        authorization="Bearer fake",
+                        cookie_header="cookie=fake",
+                        # ``receive_timeout`` is what should fire here;
+                        # ``first_byte_timeout`` is irrelevant once we yielded.
+                        receive_timeout=0.05,
+                        first_byte_timeout=0.01,
+                    ):
+                        pass
+                # Error message must reflect the stall window, not the tighter
+                # first-byte window — this guards against a regression where
+                # the wrong timeout value bleeds into the error string.
+                msg = str(ctx.exception).lower()
+                self.assertIn("stalled mid-response", msg)
+                self.assertNotIn("0.01s", msg)
+                self.assertNotIn("0.0s", msg)
+
+        asyncio.run(_run())
+
+    def test_first_byte_timeout_is_disabled_when_zero_or_above_receive(self):
+        """Caller can opt out by passing ``first_byte_timeout`` <= 0 or >=
+        ``receive_timeout``. In both cases, the existing single-timeout
+        behaviour must be preserved."""
+        for opt_out_value in (0.0, 10.0):
+            ws = _FakeWebSocket(recv_script=["STALL"])
+
+            async def _run(value: float = opt_out_value) -> None:
+                with patch("websockets.connect", _patched_connect(ws)):
+                    start = asyncio.get_event_loop().time()
+                    with self.assertRaises(ProviderEmptyResponseError):
+                        async for _ in stream_text_deltas(
+                            prompt="hi",
+                            conversation_id="00000000-0000-0000-0000-000000000000",
+                            authorization="Bearer fake",
+                            cookie_header="cookie=fake",
+                            receive_timeout=0.05,
+                            first_byte_timeout=value,
+                        ):
+                            pass
+                    # ``receive_timeout`` (0.05s) drove the deadline — neither
+                    # 0 nor a value at/above receive_timeout shortened it.
+                    elapsed = asyncio.get_event_loop().time() - start
+                    self.assertGreaterEqual(elapsed, 0.04)
+
+            asyncio.run(_run())
 
     def test_full_event_resyncs_divergent_text(self):
         """If Meta corrects an earlier token via a ``full`` event, we must
