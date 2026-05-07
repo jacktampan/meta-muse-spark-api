@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import unittest
 
-from muse_spark.api import _ScaffoldingStripper, _clean_assistant_text
+from muse_spark.api import (
+    _ScaffoldingStripper,
+    _clean_assistant_text,
+    _strip_inline_entities,
+)
 from muse_spark.client import _event_is_complete, _is_completion_op, _resync_text
 
 
@@ -138,6 +142,120 @@ class ScaffoldingStripperTests(unittest.TestCase):
         # Bare "READY" stuck in buffer (no tag, no later content) must be
         # dropped at flush time so it never surfaces to clients.
         self.assertEqual(stripper.flush(), "")
+
+
+class InlineEntityStripperTests(unittest.TestCase):
+    """Inline-entity markup (``{{IE_X}}…{{/IE_X}}``) leaks from Meta.
+
+    Pairs whose content is a citation hash or post-id get dropped entirely;
+    pairs with human-readable content are unwrapped (content kept). Orphan
+    tags from garbled streams are stripped.
+    """
+
+    def test_unwraps_human_readable_entity_name(self):
+        text = "yang {{IE_30000}}Paris Saint-Germain{{/IE_30000}} menang"
+        self.assertEqual(
+            _strip_inline_entities(text),
+            "yang Paris Saint-Germain menang",
+        )
+
+    def test_drops_citation_hash_pair(self):
+        # Pure lowercase hex content is a citation reference, not user-facing.
+        self.assertEqual(_strip_inline_entities("foo {{IE_1}}d5cd{{/IE_1}} bar"), "foo  bar")
+
+    def test_drops_post_id_pair(self):
+        text = "ref {{IE_3}}post-862616848552664650850{{/IE_3}} end"
+        self.assertEqual(_strip_inline_entities(text), "ref  end")
+
+    def test_strips_orphan_close_tag(self):
+        # Garbled streams sometimes leave bare close tags. These have no
+        # paired open and must be removed from output.
+        self.assertEqual(_strip_inline_entities("foo{{/IE_2}}bar"), "foobar")
+
+    def test_handles_paired_then_orphan_close(self):
+        # Real production example: pair with citation hash followed by an
+        # orphan close (Meta corrected output but didn't retract the markup).
+        text = "{{IE_2}}c3ce{{/IE_2}}0b57{{/IE_2}}"
+        self.assertEqual(_strip_inline_entities(text), "0b57")
+
+    def test_passthrough_when_no_markup(self):
+        self.assertEqual(_strip_inline_entities("plain text"), "plain text")
+        self.assertEqual(_strip_inline_entities(""), "")
+
+    def test_clean_assistant_text_strips_inline_entities(self):
+        # End-to-end: non-streaming path applies both scaffolding and IE
+        # stripping in a single call.
+        text = "{{IE_30000}}Lionel Messi{{/IE_30000}} scored"
+        self.assertEqual(_clean_assistant_text(text), "Lionel Messi scored")
+
+
+class ScaffoldingStripperInlineEntityTests(unittest.TestCase):
+    """Streaming-side IE handling: hold buffer correctly across chunks."""
+
+    def test_strips_complete_pair_in_single_chunk(self):
+        stripper = _ScaffoldingStripper()
+        out = stripper.feed("Hello {{IE_30000}}Paris{{/IE_30000}} done")
+        self.assertEqual(out, "Hello Paris done")
+        self.assertEqual(stripper.flush(), "")
+
+    def test_holds_partial_brace_at_chunk_end(self):
+        # `{{` at end without `}}` — mid-marker, must hold until closed.
+        stripper = _ScaffoldingStripper()
+        emitted = []
+        emitted.append(stripper.feed("Hello {{"))
+        emitted.append(stripper.feed("IE_1}}World{{/IE_1}} done"))
+        emitted.append(stripper.flush())
+        joined = "".join(emitted)
+        self.assertEqual(joined, "Hello World done")
+
+    def test_holds_open_pair_awaiting_close(self):
+        # Complete `{{IE_1}}` opener but close hasn't arrived — hold from
+        # the opener so we don't leak `{{IE_1}}content` to the wire.
+        stripper = _ScaffoldingStripper()
+        emitted = []
+        emitted.append(stripper.feed("Hello {{IE_1}}wor"))
+        # Nothing past the opener should have been emitted yet.
+        self.assertNotIn("{{IE_1}}", "".join(emitted))
+        self.assertNotIn("wor", "".join(emitted))
+        emitted.append(stripper.feed("ld{{/IE_1}} done"))
+        emitted.append(stripper.flush())
+        joined = "".join(emitted)
+        self.assertEqual(joined, "Hello world done")
+
+    def test_drops_citation_pair_split_across_chunks(self):
+        stripper = _ScaffoldingStripper()
+        emitted = []
+        emitted.append(stripper.feed("ref "))
+        emitted.append(stripper.feed("{{IE_3}}post-"))
+        emitted.append(stripper.feed("12345{{/IE_3}} end"))
+        emitted.append(stripper.flush())
+        self.assertEqual("".join(emitted), "ref  end")
+
+    def test_real_bug_garbled_stream_does_not_leak_markup(self):
+        # Reproduction of the real production output reported by users.
+        stripper = _ScaffoldingStripper()
+        chunks = [
+            "Leg {{IE_1}}d5cd{{/IE_1}}2 di Munich {{IE_1}}d5cd{{/IE_1}}, ",
+            "6 Mei {{IE_1}}d5cd{{/IE_1}}2026: {{IE_1}}d5cd{{/IE_1}}Bayern ",
+            "{{IE_1}}d5cd{{/IE_1}}1-1 {{IE_1}}d5cd{{/IE_1}}PSG.",
+        ]
+        emitted = "".join(stripper.feed(c) for c in chunks) + stripper.flush()
+        self.assertNotIn("{{", emitted)
+        self.assertNotIn("IE_", emitted)
+        self.assertIn("Leg 2 di Munich", emitted)
+        self.assertIn("6 Mei 2026", emitted)
+        self.assertIn("Bayern 1-1 PSG", emitted)
+
+    def test_unmatched_open_in_buffer_is_held_until_flush(self):
+        # If the stream never delivers a matching close, the partial markup
+        # should be dropped at flush time (never leaked unwrapped).
+        stripper = _ScaffoldingStripper()
+        out = stripper.feed("text {{IE_1}}content but no close")
+        self.assertEqual(out, "text ")
+        flushed = stripper.flush()
+        # Final flush strips the orphan opener; content survives as plain text.
+        self.assertNotIn("{{IE_", flushed)
+        self.assertIn("content but no close", flushed)
 
 
 if __name__ == "__main__":
