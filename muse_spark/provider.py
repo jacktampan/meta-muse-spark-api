@@ -74,6 +74,32 @@ def load_provider_auth(state_path: Union[Path, str] = DEFAULT_STATE_PATH) -> dic
 
 
 
+def purge_api_conversation(
+    state_path: Union[Path, str] = DEFAULT_STATE_PATH,
+    client_conversation_id: Optional[str] = None,
+) -> bool:
+    """Drop the cached client → meta conversation mapping.
+
+    Used when Meta starts returning empty responses for an existing mapping —
+    a symptom of the conversation entering a stuck state on Meta's backend
+    (typically observed after a mid-response stall). After a purge, the next
+    call to :func:`resolve_api_conversation` for the same client id rolls a
+    fresh meta conversation id and re-bootstraps from scratch.
+
+    Returns ``True`` if a mapping was removed, ``False`` if there was
+    nothing to purge (no-op).
+    """
+    if not client_conversation_id:
+        return False
+    state = load_state(state_path)
+    mappings = state.get(API_CONVERSATIONS_KEY, {})
+    if client_conversation_id not in mappings:
+        return False
+    del mappings[client_conversation_id]
+    save_state(state_path, state)
+    return True
+
+
 def resolve_api_conversation(
     state_path: Union[Path, str] = DEFAULT_STATE_PATH,
     client_conversation_id: Optional[str] = None,

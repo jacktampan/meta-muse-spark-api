@@ -12,6 +12,7 @@ from .client import CHAT_TEMPLATE_NAME, DEFAULT_STATE_PATH, HOME_TEMPLATE_NAME
 from .config import ApiSettings
 from .errors import (
     MissingAuthError,
+    ProviderEmptyResponseError,
     ProviderProtocolError,
     ProviderStallError,
     ProviderTransportError,
@@ -31,6 +32,7 @@ from .provider import (
     MuseProviderRequest,
     generate_from_state_async,
     load_provider_auth,
+    purge_api_conversation,
     resolve_api_conversation,
     stream_from_state_async,
 )
@@ -224,6 +226,10 @@ def run_api_server(
     uvicorn.run(app, host=host, port=port)
 
 
+RetryResult = tuple[AsyncIterator[str], Optional[str]]
+RetryFactory = Callable[[], Awaitable[Optional[RetryResult]]]
+
+
 async def _stream_chat_completion(
     *,
     chunk_iter: AsyncIterator[str],
@@ -233,6 +239,7 @@ async def _stream_chat_completion(
     chunk_size: int,
     logger: Any,
     bootstrap_response: Optional[str] = None,
+    retry_factory: Optional[RetryFactory] = None,
 ) -> AsyncIterator[bytes]:
     # Send role chunk first so clients (including OpenAI SDK) see the connection
     # is alive immediately, even if the upstream provider is still warming up.
@@ -248,35 +255,71 @@ async def _stream_chat_completion(
 
     stripper = _ScaffoldingStripper()
     finish_reason = "stop"
-    try:
-        async for provider_chunk in chunk_iter:
-            cleaned = stripper.feed(provider_chunk)
-            if not cleaned:
-                continue
-            for chunk in _chunk_text(cleaned, chunk_size):
-                if chunk:
-                    yield encode_sse_data(
-                        build_chat_completion_chunk(
-                            model=model,
-                            response_id=response_id,
-                            delta={"content": chunk},
-                            conversation_id=conversation_id,
-                            # Only include bootstrap in the very first content chunk
-                            # to keep the payload small.
-                            bootstrap_response=bootstrap_response,
+    yielded_any = False
+    # Attempt the stream. On ``ProviderEmptyResponseError`` with zero bytes
+    # yielded — the symptom of a stuck conversation on Meta's side after a
+    # prior stall — invoke ``retry_factory`` once to get a fresh stream and
+    # try again. ``retry_factory`` is responsible for purging the stuck
+    # mapping and rolling a new meta conversation id; it returns ``None``
+    # when no recovery is possible (e.g. brand-new conversation), in which
+    # case the empty response surfaces as a hard error.
+    while True:
+        try:
+            async for provider_chunk in chunk_iter:
+                cleaned = stripper.feed(provider_chunk)
+                if not cleaned:
+                    continue
+                for chunk in _chunk_text(cleaned, chunk_size):
+                    if chunk:
+                        yielded_any = True
+                        yield encode_sse_data(
+                            build_chat_completion_chunk(
+                                model=model,
+                                response_id=response_id,
+                                delta={"content": chunk},
+                                conversation_id=conversation_id,
+                                # Only include bootstrap in the very first content chunk
+                                # to keep the payload small.
+                                bootstrap_response=bootstrap_response,
+                            )
                         )
-                    )
-                bootstrap_response = None
-    except ProviderStallError as exc:
-        # Mid-response stall: we already streamed real content to the client.
-        # Surface it as a graceful truncation (``finish_reason="length"``)
-        # rather than an error, so OpenAI-compatible clients keep the partial
-        # output and don't raise on the caller side.
-        logger.warning("streaming_stalled: %s", exc)
-        finish_reason = "length"
-    except Exception:
-        logger.exception("streaming_failed")
-        finish_reason = "error"
+                    bootstrap_response = None
+        except ProviderStallError as exc:
+            logger.warning("streaming_stalled: %s", exc)
+            finish_reason = "length"
+            break
+        except ProviderEmptyResponseError as exc:
+            if not yielded_any and retry_factory is not None:
+                logger.warning(
+                    "streaming_empty_response_retry: %s", exc
+                )
+                replacement = await retry_factory()
+                # Bound retries to one attempt regardless of what
+                # ``retry_factory`` does next.
+                retry_factory = None
+                if replacement is not None:
+                    chunk_iter, recovered_bootstrap = replacement
+                    # The role chunk was emitted before recovery, so the
+                    # bootstrap text from the *first* attempt is already on
+                    # the wire (typically ``None`` since recovery only fires
+                    # on existing follow-up conversations). The retry's
+                    # fresh conversation runs HOME bootstrap and produces a
+                    # new bootstrap text — adopt it so the next emitted
+                    # content chunk carries it. Without this, clients that
+                    # opted into ``include_bootstrap_response`` would
+                    # silently lose the recovery's bootstrap text.
+                    if recovered_bootstrap is not None:
+                        bootstrap_response = recovered_bootstrap
+                    continue
+            logger.exception("streaming_failed")
+            finish_reason = "error"
+            break
+        except Exception:
+            logger.exception("streaming_failed")
+            finish_reason = "error"
+            break
+        else:
+            break
 
     # Always flush any buffered tail (e.g. content the stripper was holding
     # back behind a potential ``<`` or ``{{`` marker). The held content was
@@ -403,44 +446,99 @@ def create_app(
             force_single_conversation=settings.force_single_conversation,
         )
 
-        main_template = resolved.template_name
-        bootstrap_response_text: Optional[str] = None
-        # Bootstrap warms the conversation on Meta side; subsequent calls in
-        # the same request don't need their own warmup/mode_switch round-trip.
-        bootstrap_already_warmed = False
-        if resolved.template_name == HOME_TEMPLATE_NAME and compiled.bootstrap_prompt:
-            bootstrap_response = await provider_generate_fn(
-                MuseProviderRequest(
-                    prompt=compiled.bootstrap_prompt,
-                    conversation_id=resolved.meta_conversation_id,
-                    template_name=HOME_TEMPLATE_NAME,
-                    # Honour the configured timeout for the bootstrap call too —
-                    # otherwise users who raise MUSE_SPARK_RECEIVE_TIMEOUT for
-                    # slow networks still get the dataclass default here.
-                    receive_timeout=settings.receive_timeout,
-                    needs_warmup=resolved.is_new,
-                ),
-                state_path=state_path,
-            )
-            main_template = CHAT_TEMPLATE_NAME
-            bootstrap_already_warmed = True
-            if body.include_bootstrap_response:
-                bootstrap_response_text = bootstrap_response.text
+        async def _prepare_attempt(active_resolved):
+            """Run bootstrap (if needed) and build the main provider request.
 
-        provider_request = MuseProviderRequest(
-            prompt=compiled.user_prompt,
-            conversation_id=resolved.meta_conversation_id,
-            template_name=main_template,
-            user_prompt=compiled.user_prompt,
-            receive_timeout=settings.receive_timeout,
-            # Skip warmup for follow-ups (conversation already exists on Meta)
-            # and for the second call in a bootstrap round (just warmed).
-            needs_warmup=resolved.is_new and not bootstrap_already_warmed,
-        )
+            Reused by the first attempt and by the retry path that fires when
+            Meta returns an empty response on a stuck conversation. Each
+            invocation must be safe to call against a freshly resolved
+            conversation since the retry path purges and re-resolves.
+            """
+            main_template = active_resolved.template_name
+            bootstrap_text: Optional[str] = None
+            bootstrap_already_warmed = False
+            if (
+                active_resolved.template_name == HOME_TEMPLATE_NAME
+                and compiled.bootstrap_prompt
+            ):
+                bootstrap = await provider_generate_fn(
+                    MuseProviderRequest(
+                        prompt=compiled.bootstrap_prompt,
+                        conversation_id=active_resolved.meta_conversation_id,
+                        template_name=HOME_TEMPLATE_NAME,
+                        # Honour the configured timeout for the bootstrap call too —
+                        # otherwise users who raise MUSE_SPARK_RECEIVE_TIMEOUT for
+                        # slow networks still get the dataclass default here.
+                        receive_timeout=settings.receive_timeout,
+                        needs_warmup=active_resolved.is_new,
+                    ),
+                    state_path=state_path,
+                )
+                main_template = CHAT_TEMPLATE_NAME
+                bootstrap_already_warmed = True
+                if body.include_bootstrap_response:
+                    bootstrap_text = bootstrap.text
+
+            attempt_request = MuseProviderRequest(
+                prompt=compiled.user_prompt,
+                conversation_id=active_resolved.meta_conversation_id,
+                template_name=main_template,
+                user_prompt=compiled.user_prompt,
+                receive_timeout=settings.receive_timeout,
+                # Skip warmup for follow-ups (conversation already exists on Meta)
+                # and for the second call in a bootstrap round (just warmed).
+                needs_warmup=active_resolved.is_new and not bootstrap_already_warmed,
+            )
+            return attempt_request, bootstrap_text
+
+        provider_request, bootstrap_response_text = await _prepare_attempt(resolved)
+
+        async def _recover_stuck_conversation():
+            """Drop the stuck mapping and resolve a fresh meta conversation.
+
+            Called when Meta returns an empty stream for an existing
+            conversation — the symptom of the conversation being broken on
+            Meta's backend after a previous mid-response stall. Returns a
+            ``(new_resolved, new_request, new_bootstrap_text)`` tuple, or
+            ``None`` when recovery isn't applicable (brand-new conversation
+            that just failed, or no mapping to purge).
+
+            The fresh resolved conversation always lands on the HOME
+            template, so ``_prepare_attempt`` will run a bootstrap call
+            whose text must be propagated to the response — discarding it
+            silently breaks ``include_bootstrap_response`` for clients that
+            rely on it.
+            """
+            if resolved.is_new:
+                return None
+            if not purge_api_conversation(state_path, resolved.client_conversation_id):
+                return None
+            new_resolved = resolve_api_conversation(
+                state_path=state_path,
+                client_conversation_id=sticky_id,
+                force_single_conversation=settings.force_single_conversation,
+            )
+            new_request, new_bootstrap_text = await _prepare_attempt(new_resolved)
+            return new_resolved, new_request, new_bootstrap_text
 
         if body.stream:
             response_id = f"chatcmpl-{uuid.uuid4()}"
             chunk_iter = provider_stream_fn(provider_request, state_path=state_path)
+
+            async def retry_factory():
+                recovery = await _recover_stuck_conversation()
+                if recovery is None:
+                    return None
+                _new_resolved, new_request, new_bootstrap_text = recovery
+                # Returning a tuple ``(chunk_iter, bootstrap_text)`` lets
+                # ``_stream_chat_completion`` re-inject the recovered
+                # bootstrap text into the next content chunk; the original
+                # role chunk was emitted before recovery and can't carry it.
+                return (
+                    provider_stream_fn(new_request, state_path=state_path),
+                    new_bootstrap_text,
+                )
+
             response = StreamingResponse(
                 _stream_chat_completion(
                     chunk_iter=chunk_iter,
@@ -450,6 +548,7 @@ def create_app(
                     chunk_size=settings.stream_chunk_size,
                     logger=logger,
                     bootstrap_response=bootstrap_response_text,
+                    retry_factory=retry_factory,
                 ),
                 media_type="text/event-stream",
             )
@@ -462,7 +561,25 @@ def create_app(
             )
             return response
 
-        provider_response = await provider_generate_fn(provider_request, state_path=state_path)
+        try:
+            provider_response = await provider_generate_fn(
+                provider_request, state_path=state_path
+            )
+        except ProviderEmptyResponseError as exc:
+            recovery = await _recover_stuck_conversation()
+            if recovery is None:
+                raise
+            logger.warning("non_streaming_empty_response_retry: %s", exc)
+            _new_resolved, new_request, new_bootstrap_text = recovery
+            # Adopt the recovery's bootstrap text so ``include_bootstrap_response``
+            # surfaces the freshly bootstrapped greeting instead of the stale
+            # ``None`` from the stuck-conversation attempt that didn't bootstrap.
+            if new_bootstrap_text is not None:
+                bootstrap_response_text = new_bootstrap_text
+            provider_response = await provider_generate_fn(
+                new_request, state_path=state_path
+            )
+
         response = JSONResponse(
             content=build_chat_completion_response(
                 content=_clean_assistant_text(provider_response.text),

@@ -321,6 +321,181 @@ class ApiNonStreamingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("muse_spark_conv", response.cookies)
 
+    def test_chat_completions_recovers_stuck_conversation_on_empty_response(self):
+        """Non-streaming counterpart to the SSE recovery test: when Meta
+        returns an empty response on an existing conversation, the endpoint
+        should purge the stuck mapping and retry once with a fresh meta id.
+
+        Bookkeeping: an existing conversation hits ``CHAT`` template (no
+        bootstrap call), so the first call is the main request that fails.
+        The retry purges and re-resolves to a brand-new conversation, which
+        forces template ``HOME`` and therefore an additional bootstrap
+        call before the second main call. Total expected provider calls:
+        1. main on stuck conv → empty response → triggers recovery
+        2. bootstrap on fresh conv (warmup)
+        3. main on fresh conv → real reply
+        """
+        from muse_spark.client import save_state
+        from muse_spark.errors import ProviderEmptyResponseError
+
+        main_attempts: list[str] = []
+        bootstrap_attempts: list[str] = []
+
+        async def fake_provider(request, state_path=None):
+            # Distinguish bootstrap from main by template_name. Bootstrap
+            # always runs on the HOME template; the main user turn switches
+            # to CHAT after the bootstrap call.
+            if request.template_name == "home":
+                bootstrap_attempts.append(request.conversation_id)
+                return MuseProviderResponse(
+                    text="bootstrap-ack",
+                    conversation_id=request.conversation_id,
+                    template_name="home",
+                )
+            main_attempts.append(request.conversation_id)
+            if len(main_attempts) == 1:
+                raise ProviderEmptyResponseError(
+                    "Meta transport returned no usable text response."
+                )
+            return MuseProviderResponse(
+                text="real reply",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            save_state(
+                state_path,
+                {
+                    "auth": {
+                        "cookie_header": "x",
+                        "authorization": "Bearer x",
+                        "mode": "fast",
+                        "user_agent": "test",
+                    },
+                    "api_conversations": {
+                        "tg-99": {
+                            "meta_conversation_id": "stuck-meta-id",
+                            "created_at": 1,
+                            "last_used_at": 1,
+                        }
+                    },
+                },
+            )
+
+            app = create_app(
+                provider_generate_fn=fake_provider,
+                state_path=state_path,
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"x-conversation-id": "tg-99"},
+                json={
+                    "model": "meta/muse-spark",
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["choices"][0]["message"]["content"], "real reply")
+        # Two main calls: original (stuck) + retry on fresh conv.
+        self.assertEqual(
+            len(main_attempts), 2,
+            f"Expected 2 main attempts, got {main_attempts}",
+        )
+        self.assertEqual(main_attempts[0], "stuck-meta-id")
+        self.assertNotEqual(
+            main_attempts[1], "stuck-meta-id",
+            "Retry must use a fresh meta conversation id after purge",
+        )
+        # Bootstrap fires exactly once — for the recovery conversation.
+        self.assertEqual(
+            len(bootstrap_attempts), 1,
+            f"Expected 1 bootstrap call, got {bootstrap_attempts}",
+        )
+        self.assertEqual(bootstrap_attempts[0], main_attempts[1])
+
+    def test_chat_completions_recovery_propagates_bootstrap_response_text(self):
+        """When recovery fires for a stuck conversation, the recovery path
+        re-bootstraps from a fresh meta conversation (HOME template). If the
+        client requested ``include_bootstrap_response=true``, that fresh
+        bootstrap text must reach the response — discarding it silently
+        breaks the ``bootstrap_response`` field for any caller that relies
+        on it (regression for Devin Review BUG_pr-review-job-…_0001).
+        """
+        from muse_spark.client import save_state
+        from muse_spark.errors import ProviderEmptyResponseError
+
+        async def fake_provider(request, state_path=None):
+            # Bootstrap call → return a recognisable greeting. Main user
+            # call → first invocation fails empty (stuck conv); second
+            # invocation (after recovery) succeeds.
+            if request.template_name == "home":
+                return MuseProviderResponse(
+                    text="HELLO FROM RECOVERED BOOTSTRAP",
+                    conversation_id=request.conversation_id,
+                    template_name="home",
+                )
+            if request.conversation_id == "stuck-meta-id":
+                raise ProviderEmptyResponseError(
+                    "Meta transport returned no usable text response."
+                )
+            return MuseProviderResponse(
+                text="real reply",
+                conversation_id=request.conversation_id,
+                template_name="chat",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            save_state(
+                state_path,
+                {
+                    "auth": {
+                        "cookie_header": "x",
+                        "authorization": "Bearer x",
+                        "mode": "fast",
+                        "user_agent": "test",
+                    },
+                    "api_conversations": {
+                        "tg-100": {
+                            "meta_conversation_id": "stuck-meta-id",
+                            "created_at": 1,
+                            "last_used_at": 1,
+                        }
+                    },
+                },
+            )
+
+            app = create_app(
+                provider_generate_fn=fake_provider,
+                state_path=state_path,
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"x-conversation-id": "tg-100"},
+                json={
+                    "model": "meta/muse-spark",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "include_bootstrap_response": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["choices"][0]["message"]["content"], "real reply")
+        # The recovery's fresh bootstrap text must appear in the response.
+        # Without the fix, ``bootstrap_response`` would be ``None``/missing
+        # because the original attempt was on an existing conv with no
+        # bootstrap, and the retry's bootstrap text was being discarded.
+        self.assertEqual(payload.get("bootstrap_response"), "HELLO FROM RECOVERED BOOTSTRAP")
+
     def test_models_endpoint_lists_meta_muse_spark(self):
         app = create_app()
         client = TestClient(app)

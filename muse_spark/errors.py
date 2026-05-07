@@ -29,3 +29,15 @@ class ProviderStallError(ProviderProtocolError):
     than ``"error"``. Clients that already received tokens get a graceful end
     of stream instead of having the request appear to fail outright.
     """
+
+
+class ProviderEmptyResponseError(ProviderProtocolError):
+    """Meta accepted the request and closed the stream without emitting text.
+
+    Observed in production after a previous mid-response stall: the affected
+    conversation enters a stuck state on Meta's backend and every subsequent
+    turn sent through the same conversation id receives an empty stream. The
+    SSE pipeline catches this, purges the stuck mapping, and retries once
+    with a fresh meta conversation id so the client doesn't have to manually
+    reset state.
+    """
