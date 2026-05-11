@@ -38,7 +38,6 @@ class MuseProviderRequest:
     # ``None`` (or any value >= ``receive_timeout``) disables the optimisation
     # and falls back to the existing single-timeout behaviour.
     first_byte_timeout: Optional[float] = 20.0
-    bootstrap_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
     # When False, callers signal the conversation is already warm on Meta's
     # side and the per-request warmup + mode_switch GraphQL round-trips can
@@ -169,21 +168,7 @@ async def generate_from_state_async(
             mode=auth["mode"],
             user_agent=auth["user_agent"],
         )
-    bootstrap_prompt = request.bootstrap_prompt or ""
     user_prompt = request.user_prompt or request.prompt
-    if bootstrap_prompt:
-        await generate_fn(
-            prompt=bootstrap_prompt,
-            conversation_id=conversation_id,
-            authorization=auth["authorization"],
-            cookie_header=auth["cookie_header"],
-            mode=auth["mode"],
-            user_agent=auth["user_agent"],
-            switch_mode_first=False,
-            receive_timeout=request.receive_timeout,
-            first_byte_timeout=request.first_byte_timeout,
-            template_name=HOME_TEMPLATE_NAME,
-        )
     text = await generate_fn(
         prompt=user_prompt,
         conversation_id=conversation_id,
@@ -231,22 +216,7 @@ async def stream_from_state_async(
             mode=auth["mode"],
             user_agent=auth["user_agent"],
         )
-    bootstrap_prompt = request.bootstrap_prompt or ""
     user_prompt = request.user_prompt or request.prompt
-    if bootstrap_prompt:
-        async for chunk in stream_fn(
-            prompt=bootstrap_prompt,
-            conversation_id=conversation_id,
-            authorization=auth["authorization"],
-            cookie_header=auth["cookie_header"],
-            mode=auth["mode"],
-            user_agent=auth["user_agent"],
-            switch_mode_first=False,
-            receive_timeout=request.receive_timeout,
-            first_byte_timeout=request.first_byte_timeout,
-            template_name=HOME_TEMPLATE_NAME,
-        ):
-            _ = chunk
     async for chunk in stream_fn(
         prompt=user_prompt,
         conversation_id=conversation_id,

@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
 class StatefulTurnPlan:
-    bootstrap_prompt: str
+    """Compiled prompt for a single Meta turn.
+
+    ``system_preamble`` carries any user-provided ``system``/``developer``
+    instructions wrapped in XML so they can be prepended to the very first
+    user turn. ``user_prompt`` carries the most recent user message wrapped
+    in ``<conversation_turn><user_message>...`` scaffolding. For follow-up
+    turns the caller should send ``user_prompt`` alone — Meta retains its
+    own conversation state and re-sending the preamble each turn would
+    just waste tokens.
+    """
+
     user_prompt: str
+    system_preamble: str = ""
     truncated: bool = False
     dropped_messages: int = 0
     kept_messages: int = 0
@@ -68,28 +79,29 @@ def _extract_messages(messages: list[dict[str, Any]]) -> tuple[list[str], list[_
 
 
 
-def _build_bootstrap_prompt(system_messages: list[str], max_chars: int) -> tuple[str, bool]:
-    instruction_items = [
-        "<instruction>Use the conversation state across turns instead of replaying a stateless transcript.</instruction>",
-        "<instruction>Answer the user's actual request directly.</instruction>",
-        "<instruction>Preserve markdown code fences when returning code.</instruction>",
-        "<instruction>Prefer clear XML-tagged structure when organizing instructions.</instruction>",
-        "<instruction>Reply with exactly READY.</instruction>",
-    ]
+def _build_system_preamble(system_messages: list[str], max_chars: int) -> tuple[str, bool]:
+    """Render user-provided system/developer instructions as an XML preamble.
+
+    Returns an empty string when no system messages were supplied — the
+    caller treats that as "nothing to prepend". Unlike the previous
+    bootstrap-prompt scheme, this preamble has *no* fixed scaffolding text
+    (no "Reply with exactly READY", no fixed instruction list). Only the
+    caller's own system messages are emitted, so a request without any
+    system messages results in an empty preamble.
+    """
+    if not system_messages:
+        return "", False
     setup_bits = [
         "<conversation_setup>",
         "  <system_instructions>",
-        f"    {' '.join(instruction_items)}",
     ]
-    if system_messages:
-        setup_bits.append("    <conversation_preamble>")
-        for index, message in enumerate(system_messages, start=1):
-            setup_bits.append(f"      <instruction index=\"{index}\">{_escape_xml(message)}</instruction>")
-        setup_bits.append("    </conversation_preamble>")
+    for index, message in enumerate(system_messages, start=1):
+        setup_bits.append(
+            f"    <instruction index=\"{index}\">{_escape_xml(message)}</instruction>"
+        )
     setup_bits.extend(
         [
             "  </system_instructions>",
-            "  <acknowledgement>READY</acknowledgement>",
             "</conversation_setup>",
         ]
     )
@@ -129,13 +141,13 @@ def build_stateful_turn_plan(
         raise ValueError("messages must include at least one user message")
 
     latest_user = user_messages[-1]
-    bootstrap_prompt, bootstrap_truncated = _build_bootstrap_prompt(system_messages, max_chars)
+    system_preamble, preamble_truncated = _build_system_preamble(system_messages, max_chars)
     user_prompt, user_truncated = _build_user_prompt(latest_user, max_chars)
 
     return StatefulTurnPlan(
-        bootstrap_prompt=bootstrap_prompt,
         user_prompt=user_prompt,
-        truncated=bootstrap_truncated or user_truncated,
+        system_preamble=system_preamble,
+        truncated=preamble_truncated or user_truncated,
         dropped_messages=max(0, len(user_messages) - 1),
         kept_messages=1,
     )

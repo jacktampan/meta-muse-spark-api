@@ -4,7 +4,7 @@ from muse_spark.prompt_compiler import build_stateful_turn_plan
 
 
 class StatefulPromptCompilerTests(unittest.TestCase):
-    def test_build_stateful_turn_plan_emits_xml_bootstrap_and_latest_user_turn(self):
+    def test_build_stateful_turn_plan_emits_system_preamble_and_latest_user_turn(self):
         plan = build_stateful_turn_plan(
             [
                 {"role": "system", "content": "You are a sharp frontend engineer."},
@@ -16,12 +16,17 @@ class StatefulPromptCompilerTests(unittest.TestCase):
             max_chars=4000,
         )
 
-        self.assertIn("<conversation_setup>", plan.bootstrap_prompt)
-        self.assertIn("<system_instructions>", plan.bootstrap_prompt)
-        self.assertIn("<acknowledgement>READY</acknowledgement>", plan.bootstrap_prompt)
-        self.assertIn("You are a sharp frontend engineer.", plan.bootstrap_prompt)
-        self.assertIn("Prefer concise answers.", plan.bootstrap_prompt)
-        self.assertNotIn("<now>", plan.bootstrap_prompt)
+        # System/developer messages are folded into the system_preamble as XML.
+        self.assertIn("<conversation_setup>", plan.system_preamble)
+        self.assertIn("<system_instructions>", plan.system_preamble)
+        self.assertIn("You are a sharp frontend engineer.", plan.system_preamble)
+        self.assertIn("Prefer concise answers.", plan.system_preamble)
+        # The old "Reply with exactly READY" / fixed instruction list is gone.
+        self.assertNotIn("READY", plan.system_preamble)
+        self.assertNotIn("Preserve markdown code fences", plan.system_preamble)
+        # Latest user message is in user_prompt, escaped, with no leakage of
+        # earlier turns (which Meta already remembers via its own state).
+        self.assertNotIn("<now>", plan.system_preamble)
         self.assertNotIn("<now>", plan.user_prompt)
         self.assertIn("<conversation_turn>", plan.user_prompt)
         self.assertIn("Now refactor the navbar.", plan.user_prompt)
@@ -43,6 +48,21 @@ class StatefulPromptCompilerTests(unittest.TestCase):
         self.assertNotIn("ignored", plan.user_prompt)
         self.assertEqual(plan.kept_messages, 1)
         self.assertEqual(plan.dropped_messages, 1)
+
+    def test_build_stateful_turn_plan_omits_system_preamble_when_no_system_messages(self):
+        """With no client-supplied system/developer messages, the preamble
+        is empty — the legacy fixed "READY" handshake is gone, so a request
+        without system messages results in *just* the user prompt going to
+        Meta. This keeps turn 1 lean (the user's accepted trade-off for
+        dropping the bootstrap round-trip).
+        """
+        plan = build_stateful_turn_plan(
+            [{"role": "user", "content": "Write me a landing page hero."}],
+            max_chars=4000,
+        )
+
+        self.assertEqual(plan.system_preamble, "")
+        self.assertIn("Write me a landing page hero.", plan.user_prompt)
 
     def test_build_stateful_turn_plan_raises_for_empty_messages(self):
         with self.assertRaises(ValueError):

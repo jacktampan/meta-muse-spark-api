@@ -1,3 +1,12 @@
+"""Verifies that the bootstrap round-trip has been removed.
+
+Previously the API made *two* sequential provider calls on the first turn of
+a fresh conversation: a hidden ``bootstrap`` priming call followed by the
+user's actual prompt. That round-trip is gone — any system/developer
+messages are now folded into a single combined prompt and sent in one
+provider call. These tests guard against accidental re-introduction.
+"""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,22 +16,21 @@ from muse_spark.api import create_app
 from muse_spark.provider import MuseProviderResponse
 
 
-class BootstrapDebugTests(unittest.TestCase):
-    def test_chat_completions_can_expose_bootstrap_response_when_requested(self):
+class NoBootstrapRoundtripTests(unittest.TestCase):
+    def test_chat_completions_does_not_make_separate_bootstrap_call(self):
+        """First turn of a new conversation must use exactly *one* provider
+        call. The legacy bootstrap+main pair would have produced two
+        invocations; the lean design folds system instructions into the
+        single user-turn prompt.
+        """
         seen = []
 
         async def fake_provider(request, state_path=None):
             seen.append(request)
-            if len(seen) == 1:
-                return MuseProviderResponse(
-                    text="bootstrap debug reply",
-                    conversation_id=request.conversation_id,
-                    template_name="home",
-                )
             return MuseProviderResponse(
-                text="final answer",
+                text="hello",
                 conversation_id=request.conversation_id,
-                template_name="chat",
+                template_name=request.template_name,
             )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -34,33 +42,39 @@ class BootstrapDebugTests(unittest.TestCase):
                 "/v1/chat/completions",
                 json={
                     "model": "meta/muse-spark",
-                    "include_bootstrap_response": True,
-                    "messages": [{"role": "user", "content": "first turn"}],
+                    "messages": [
+                        {"role": "system", "content": "Be terse."},
+                        {"role": "user", "content": "first turn"},
+                    ],
                 },
             )
 
-            payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(seen), 1, f"Expected exactly 1 provider call, got {seen}")
+        # Critically: system instructions still reach Meta — they're just
+        # inlined into the same prompt rather than sent as a separate turn.
+        self.assertIn("Be terse.", seen[0].prompt)
+        self.assertIn("first turn", seen[0].prompt)
+        # And the legacy bootstrap_response field never appears on responses.
+        self.assertNotIn("bootstrap_response", response.json())
 
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(payload["choices"][0]["message"]["content"], "final answer")
-            self.assertEqual(payload["bootstrap_response"], "bootstrap debug reply")
-            self.assertEqual(len(seen), 2)
-            self.assertEqual(seen[0].template_name, "home")
-            self.assertEqual(seen[1].template_name, "chat")
-
-    def test_stream_chat_completions_can_expose_bootstrap_response_when_requested(self):
-        async def fake_provider(request, state_path=None):
-            return MuseProviderResponse(
-                text="bootstrap debug reply" if request.template_name == "home" else "final answer",
-                conversation_id=request.conversation_id,
-                template_name=request.template_name,
-            )
-
+    def test_stream_chat_completions_does_not_emit_bootstrap_response_field(self):
+        """Streaming counterpart: SSE chunks must not carry the legacy
+        ``bootstrap_response`` field. Clients that previously opted into it
+        now just get the same chunks as everyone else.
+        """
         async def fake_provider_stream(request, state_path=None):
             for chunk in ["final", " answer"]:
                 yield chunk
 
-        app = create_app(provider_generate_fn=fake_provider, provider_stream_fn=fake_provider_stream)
+        async def fake_provider_generate(request, state_path=None):
+            return MuseProviderResponse(
+                text="unused",
+                conversation_id=request.conversation_id,
+                template_name=request.template_name,
+            )
+
+        app = create_app(provider_generate_fn=fake_provider_generate, provider_stream_fn=fake_provider_stream)
         client = TestClient(app)
 
         with client.stream(
@@ -68,7 +82,6 @@ class BootstrapDebugTests(unittest.TestCase):
             "/v1/chat/completions",
             json={
                 "model": "meta/muse-spark",
-                "include_bootstrap_response": True,
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
             },
@@ -76,6 +89,6 @@ class BootstrapDebugTests(unittest.TestCase):
             body = b"".join(response.iter_bytes()).decode("utf-8")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn('"bootstrap_response":"bootstrap debug reply"', body)
+        self.assertNotIn("bootstrap_response", body)
         self.assertIn('"content":"final"', body)
-        self.assertIn('data: [DONE]', body)
+        self.assertIn("data: [DONE]", body)
