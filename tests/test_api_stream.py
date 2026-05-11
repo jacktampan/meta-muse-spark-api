@@ -321,36 +321,32 @@ class ApiStreamingTests(unittest.TestCase):
         self.assertIn('"finish_reason":"stop"', body)
         self.assertNotIn('"finish_reason":"error"', body)
 
-    def test_chat_completions_stream_recovery_propagates_bootstrap_response(self):
-        """Streaming counterpart to the non-streaming bootstrap-propagation
-        test: when recovery fires on a stuck conversation, the retry runs
-        a fresh HOME-template bootstrap. If the client opted into
-        ``include_bootstrap_response``, that recovered bootstrap text must
-        end up in a content chunk after the retry — without it, the field
-        is silently dropped and the client never sees the fresh greeting
-        (regression for Devin Review BUG_pr-review-job-…_0001).
+    def test_chat_completions_stream_surfaces_stuck_when_retry_also_fails(self):
+        """If both the original stream and the recovery retry come back
+        empty, the SSE pipeline must signal the stuck-conversation case
+        explicitly via ``finish_reason="stuck"`` so clients can detect it
+        and call ``/v1/reset`` instead of silently treating it as a
+        successful "stop".
         """
-        import json as _json
         import tempfile
         from pathlib import Path
         from muse_spark.client import save_state
         from muse_spark.errors import ProviderEmptyResponseError
 
+        attempts: list[str] = []
+
         async def fake_provider_stream(request, state_path=None):
-            if request.conversation_id == "stuck-meta-id":
-                raise ProviderEmptyResponseError(
-                    "Meta transport returned no usable text response."
-                )
-            for token in ("real ", "answer"):
-                yield token
+            attempts.append(request.conversation_id)
+            raise ProviderEmptyResponseError(
+                "Meta transport returned no usable text response."
+            )
+            yield ""  # pragma: no cover — keeps this an async generator
 
         async def fake_provider_generate(request, state_path=None):
-            # Bootstrap call on the recovered fresh conv. Use a sentinel
-            # that's easy to spot in the SSE body.
             return MuseProviderResponse(
-                text="HELLO_RECOVERED_BOOTSTRAP",
+                text="unused",
                 conversation_id=request.conversation_id,
-                template_name="home",
+                template_name=request.template_name,
             )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,44 +385,21 @@ class ApiStreamingTests(unittest.TestCase):
                     "model": "meta/muse-spark",
                     "messages": [{"role": "user", "content": "ping"}],
                     "stream": True,
-                    "include_bootstrap_response": True,
                 },
             ) as response:
                 body = b"".join(response.iter_bytes()).decode("utf-8")
 
         self.assertEqual(response.status_code, 200)
-        # Sanity: recovery worked — real content reached the client.
-        self.assertIn("real", body)
-        self.assertIn("answer", body)
-        self.assertIn('"finish_reason":"stop"', body)
-
-        # Walk the SSE chunks and confirm at least one *content* chunk
-        # carries the recovered bootstrap text. Parsing the JSON rather
-        # than substring-matching avoids accidental matches against the
-        # sentinel appearing in a different field name later.
-        bootstrap_chunks = []
-        for line in body.splitlines():
-            if not line.startswith("data: "):
-                continue
-            data = line[len("data: "):]
-            if data.strip() == "[DONE]":
-                continue
-            try:
-                obj = _json.loads(data)
-            except _json.JSONDecodeError:
-                continue
-            if obj.get("bootstrap_response") == "HELLO_RECOVERED_BOOTSTRAP":
-                bootstrap_chunks.append(obj)
-
-        self.assertTrue(
-            bootstrap_chunks,
-            "Expected at least one chunk to carry the recovery's bootstrap_response",
-        )
+        # Two attempts (original + 1 retry), both empty, then surface stuck.
+        self.assertEqual(len(attempts), 2, f"Expected 2 attempts, got {attempts}")
+        self.assertIn('"finish_reason":"stuck"', body)
+        self.assertNotIn('"finish_reason":"stop"', body)
 
     def test_chat_completions_stream_does_not_retry_brand_new_conversation(self):
         """If the very first request to a fresh conversation gets an empty
         response, retrying with a different conversation id won't help —
-        the problem is upstream. Surface as a hard error.
+        the problem is upstream. Surface ``finish_reason="stuck"`` directly
+        so clients can call ``/v1/reset`` or back off.
         """
         from muse_spark.errors import ProviderEmptyResponseError
 
@@ -443,9 +416,9 @@ class ApiStreamingTests(unittest.TestCase):
 
         async def fake_provider_generate(request, state_path=None):
             return MuseProviderResponse(
-                text="bootstrap-ack",
+                text="unused",
                 conversation_id=request.conversation_id,
-                template_name="home",
+                template_name=request.template_name,
             )
 
         app = create_app(
@@ -468,7 +441,7 @@ class ApiStreamingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         # Only one attempt — no retry on brand-new conversations.
         self.assertEqual(len(attempts), 1)
-        self.assertIn('"finish_reason":"error"', body)
+        self.assertIn('"finish_reason":"stuck"', body)
 
     def test_chat_completions_stream_sets_sticky_conversation_cookie(self):
         async def fake_provider_stream(request, state_path=None):

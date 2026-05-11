@@ -115,16 +115,37 @@ incoming /v1/chat/completions call would start a brand-new Meta conversation.
 The API resolves the conversation in the following priority order:
   1. `body.conversation_id` (vendor extension on the request body)
   2. `X-Conversation-Id` request header (recommended for agent frameworks)
-  3. `muse_spark_conv` cookie (auto-set on every response, useful for browsers)
-  4. `--single-conversation` / `MUSE_SPARK_FORCE_SINGLE_CONVERSATION=1` (a
+  3. `body.user` (standard OpenAI request field; most SDKs auto-set this)
+  4. `muse_spark_conv` cookie (auto-set on every response, useful for browsers)
+  5. `--single-conversation` / `MUSE_SPARK_FORCE_SINGLE_CONVERSATION=1` (a
      single shared conversation for the whole server)
 This makes it trivial to wire Muse Spark behind agents that don't know about
 the `conversation_id` body field.
 
+Stuck-conversation recovery
+- On `/v1/chat/completions` the API silently retries once on a fresh
+  meta_conversation_id when Meta returns an empty response on an existing
+  conversation (a wedge usually caused by a prior stall).
+- If the retry *also* comes back empty, the API surfaces 503 Service
+  Unavailable with `{"error": {"type": "service_unavailable",
+  "code": "stuck_conversation", ...}}`. In streaming mode the SSE pipeline
+  terminates with `finish_reason="stuck"` (distinct from `stop`, `length`,
+  and `error`).
+- `POST /v1/reset` is the operator escape hatch:
+    `{"conversation_id": "tg-chat-42"}` → purge just that mapping.
+    `{}` or no body → purge **all** mappings.
+    Returns `{"reset": true, "purged_count": N}`.
+- In single-conversation mode (`MUSE_SPARK_FORCE_SINGLE_CONVERSATION=1`)
+  the server rolls a fresh meta_conversation_id on every startup so each
+  process restart is a clean slate.
+
 Notes
 - The API is stateful: each OpenAI conversation_id maps to a persistent Meta conversation under the hood.
 - Use `--single-conversation` if you want all requests to share the exact same history (useful for simple agents).
-- New conversations use a hidden bootstrap turn, then the real user turn.
+- Each turn issues exactly one provider request — there is no hidden
+  bootstrap turn. Any `system`/`developer` messages are folded into a
+  `<conversation_setup>` preamble that ships inline with the first user
+  prompt of a fresh Meta conversation.
 - Follow ups reuse the same conversation_id and send only the latest user message; the per-request `warmup_conversation` and `mode_switch` GraphQL round-trips are skipped to halve follow-up latency.
 - If a stream stalls mid-response (no data within `MUSE_SPARK_RECEIVE_TIMEOUT`) and tokens were already streamed, the API surfaces partial output with `finish_reason="length"` (graceful truncation). If nothing was streamed yet, it returns `finish_reason="error"`. Either way a terminal SSE chunk + `[DONE]` is always emitted, so OpenAI-compatible clients never hang.
 - The stateless transcript compiler is removed; stateful XML turn planning is the only chat path.

@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Union
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .client import CHAT_TEMPLATE_NAME, DEFAULT_STATE_PATH, HOME_TEMPLATE_NAME
+from .client import DEFAULT_STATE_PATH, HOME_TEMPLATE_NAME, load_state, save_state
 from .config import ApiSettings
 from .errors import (
     MissingAuthError,
@@ -29,6 +29,7 @@ from .openai_compat import (
 )
 from .prompt_compiler import build_stateful_turn_plan
 from .provider import (
+    API_CONVERSATIONS_KEY,
     MuseProviderRequest,
     generate_from_state_async,
     load_provider_auth,
@@ -229,8 +230,7 @@ def run_api_server(
     uvicorn.run(app, host=host, port=port)
 
 
-RetryResult = tuple[AsyncIterator[str], Optional[str]]
-RetryFactory = Callable[[], Awaitable[Optional[RetryResult]]]
+RetryFactory = Callable[[], Awaitable[Optional[AsyncIterator[str]]]]
 
 
 async def _stream_chat_completion(
@@ -241,7 +241,6 @@ async def _stream_chat_completion(
     conversation_id: str,
     chunk_size: int,
     logger: Any,
-    bootstrap_response: Optional[str] = None,
     retry_factory: Optional[RetryFactory] = None,
 ) -> AsyncIterator[bytes]:
     # Send role chunk first so clients (including OpenAI SDK) see the connection
@@ -252,7 +251,6 @@ async def _stream_chat_completion(
             response_id=response_id,
             delta={"role": "assistant"},
             conversation_id=conversation_id,
-            bootstrap_response=bootstrap_response,
         )
     )
 
@@ -265,7 +263,8 @@ async def _stream_chat_completion(
     # try again. ``retry_factory`` is responsible for purging the stuck
     # mapping and rolling a new meta conversation id; it returns ``None``
     # when no recovery is possible (e.g. brand-new conversation), in which
-    # case the empty response surfaces as a hard error.
+    # case the empty response surfaces as ``finish_reason="stuck"`` so the
+    # client can call ``/v1/reset`` and retry.
     while True:
         try:
             async for provider_chunk in chunk_iter:
@@ -281,12 +280,8 @@ async def _stream_chat_completion(
                                 response_id=response_id,
                                 delta={"content": chunk},
                                 conversation_id=conversation_id,
-                                # Only include bootstrap in the very first content chunk
-                                # to keep the payload small.
-                                bootstrap_response=bootstrap_response,
                             )
                         )
-                    bootstrap_response = None
         except ProviderStallError as exc:
             logger.warning("streaming_stalled: %s", exc)
             finish_reason = "length"
@@ -301,21 +296,10 @@ async def _stream_chat_completion(
                 # ``retry_factory`` does next.
                 retry_factory = None
                 if replacement is not None:
-                    chunk_iter, recovered_bootstrap = replacement
-                    # The role chunk was emitted before recovery, so the
-                    # bootstrap text from the *first* attempt is already on
-                    # the wire (typically ``None`` since recovery only fires
-                    # on existing follow-up conversations). The retry's
-                    # fresh conversation runs HOME bootstrap and produces a
-                    # new bootstrap text — adopt it so the next emitted
-                    # content chunk carries it. Without this, clients that
-                    # opted into ``include_bootstrap_response`` would
-                    # silently lose the recovery's bootstrap text.
-                    if recovered_bootstrap is not None:
-                        bootstrap_response = recovered_bootstrap
+                    chunk_iter = replacement
                     continue
-            logger.exception("streaming_failed")
-            finish_reason = "error"
+            logger.warning("streaming_stuck_conversation: %s", exc)
+            finish_reason = "stuck"
             break
         except Exception:
             logger.exception("streaming_failed")
@@ -340,13 +324,13 @@ async def _stream_chat_completion(
                         response_id=response_id,
                         delta={"content": chunk},
                         conversation_id=conversation_id,
-                        bootstrap_response=bootstrap_response,
                     )
                 )
-            bootstrap_response = None
 
     # Always emit a terminal chunk + [DONE] so clients don't hang. Use
-    # finish_reason="error" on failure so callers can detect partial output.
+    # ``finish_reason="error"`` on transport/unknown failure and
+    # ``finish_reason="stuck"`` specifically when Meta's backend wedged the
+    # conversation so the client can detect that case and call /v1/reset.
     yield encode_sse_data(
         build_chat_completion_chunk(
             model=model,
@@ -354,7 +338,6 @@ async def _stream_chat_completion(
             delta={},
             finish_reason=finish_reason,
             conversation_id=conversation_id,
-            bootstrap_response=bootstrap_response,
         )
     )
     yield encode_sse_done()
@@ -374,6 +357,17 @@ def create_app(
     logger = get_logger("muse_spark.api", settings.log_level)
     app = FastAPI(title="Muse Spark OpenAI-Compatible API")
     app.state.settings = settings
+
+    # Predictable starting state: in single-conversation mode, every server
+    # startup rolls a fresh meta_conversation_id by purging any cached
+    # mapping left behind by the previous process. This matches user
+    # expectation that "restart = clean state" and avoids long-lived
+    # state.json mappings re-attaching the new process to a Meta-side
+    # conversation that may already be wedged.
+    if settings.force_single_conversation:
+        purged = purge_api_conversation(state_path, "default-single-conversation")
+        if purged:
+            logger.info("force_single_conversation_rolled_on_startup")
 
     def error_json(status_code: int, code: str, message: str, error_type: str = "invalid_request_error") -> JSONResponse:
         return JSONResponse(
@@ -403,6 +397,14 @@ def create_app(
     async def handle_transport_error(request, exc: ProviderTransportError):
         return error_json(502, "provider_transport_error", str(exc), error_type="provider_error")
 
+    @app.exception_handler(ProviderEmptyResponseError)
+    async def handle_empty_response(request, exc: ProviderEmptyResponseError):
+        # Distinct from the generic ProviderProtocolError handler below so the
+        # client can detect "Meta wedged this conversation, try /v1/reset"
+        # specifically. 503 Service Unavailable matches the semantics of
+        # ChatGPT/Claude's transient-overload responses.
+        return error_json(503, "stuck_conversation", str(exc), error_type="service_unavailable")
+
     @app.exception_handler(ProviderProtocolError)
     async def handle_protocol_error(request, exc: ProviderProtocolError):
         return error_json(502, "provider_protocol_error", str(exc), error_type="provider_error")
@@ -420,6 +422,43 @@ def create_app(
     async def list_models() -> dict[str, Any]:
         return build_models_response([settings.model_name])
 
+    @app.post("/v1/reset")
+    async def reset_conversation(request: Request) -> dict[str, Any]:
+        """Operator escape hatch for clearing stuck conversations.
+
+        Body is optional JSON. With ``{"conversation_id": "<id>"}`` purges
+        a single client→meta mapping. With no body (or ``{}``) purges all
+        mappings — useful when restarting bot state after Meta backend
+        problems, or for blanket cleanup. Always returns 200 with a count;
+        purging a non-existent id is a no-op.
+        """
+        body: dict[str, Any] = {}
+        try:
+            parsed = await request.json()
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            body = parsed
+
+        conversation_id = body.get("conversation_id") if isinstance(body.get("conversation_id"), str) else None
+        if conversation_id:
+            purged = purge_api_conversation(state_path, conversation_id)
+            logger.info("reset conversation_id=%s purged=%s", conversation_id, purged)
+            return {
+                "reset": True,
+                "conversation_id": conversation_id,
+                "purged_count": 1 if purged else 0,
+            }
+
+        state = load_state(state_path)
+        mappings = state.get(API_CONVERSATIONS_KEY, {})
+        purged_count = len(mappings)
+        if purged_count:
+            state[API_CONVERSATIONS_KEY] = {}
+            save_state(state_path, state)
+        logger.info("reset_all purged_count=%s", purged_count)
+        return {"reset": True, "purged_count": purged_count}
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, body: ChatCompletionsRequest):
         if body.model != settings.model_name:
@@ -436,11 +475,13 @@ def create_app(
         # Sticky conversation resolution priority:
         #   1. body.conversation_id (explicit, OpenAI vendor extension)
         #   2. X-Conversation-Id header (agent frameworks that expose custom headers)
-        #   3. muse_spark_conv cookie (browser-style clients)
-        #   4. settings.force_single_conversation (server-wide single conversation mode)
+        #   3. body.user (standard OpenAI request field; most SDKs auto-set it)
+        #   4. muse_spark_conv cookie (browser-style clients)
+        #   5. settings.force_single_conversation (server-wide single conversation mode)
         sticky_id = (
             body.conversation_id
             or request.headers.get("x-conversation-id")
+            or body.user
             or request.cookies.get("muse_spark_conv")
         )
         resolved = resolve_api_conversation(
@@ -449,70 +490,47 @@ def create_app(
             force_single_conversation=settings.force_single_conversation,
         )
 
-        async def _prepare_attempt(active_resolved):
-            """Run bootstrap (if needed) and build the main provider request.
+        def _build_request(active_resolved):
+            """Build the single provider request for this turn.
 
-            Reused by the first attempt and by the retry path that fires when
-            Meta returns an empty response on a stuck conversation. Each
-            invocation must be safe to call against a freshly resolved
-            conversation since the retry path purges and re-resolves.
+            For the very first turn on a fresh conversation, any client-
+            supplied system/developer instructions are inlined as a
+            ``<conversation_setup>`` preamble *in the same prompt* — Meta
+            is stateful, so we only need one round-trip per turn instead
+            of the legacy bootstrap+main pair. Continuation turns send
+            only the user message; Meta already remembers prior context.
             """
-            main_template = active_resolved.template_name
-            bootstrap_text: Optional[str] = None
-            bootstrap_already_warmed = False
+            prompt = compiled.user_prompt
             if (
                 active_resolved.template_name == HOME_TEMPLATE_NAME
-                and compiled.bootstrap_prompt
+                and compiled.system_preamble
             ):
-                bootstrap = await provider_generate_fn(
-                    MuseProviderRequest(
-                        prompt=compiled.bootstrap_prompt,
-                        conversation_id=active_resolved.meta_conversation_id,
-                        template_name=HOME_TEMPLATE_NAME,
-                        # Honour the configured timeout for the bootstrap call too —
-                        # otherwise users who raise MUSE_SPARK_RECEIVE_TIMEOUT for
-                        # slow networks still get the dataclass default here.
-                        receive_timeout=settings.receive_timeout,
-                        first_byte_timeout=settings.first_byte_timeout,
-                        needs_warmup=active_resolved.is_new,
-                    ),
-                    state_path=state_path,
-                )
-                main_template = CHAT_TEMPLATE_NAME
-                bootstrap_already_warmed = True
-                if body.include_bootstrap_response:
-                    bootstrap_text = bootstrap.text
+                prompt = f"{compiled.system_preamble}\n{compiled.user_prompt}"
 
-            attempt_request = MuseProviderRequest(
-                prompt=compiled.user_prompt,
+            return MuseProviderRequest(
+                prompt=prompt,
                 conversation_id=active_resolved.meta_conversation_id,
-                template_name=main_template,
-                user_prompt=compiled.user_prompt,
+                template_name=active_resolved.template_name,
+                user_prompt=prompt,
                 receive_timeout=settings.receive_timeout,
                 first_byte_timeout=settings.first_byte_timeout,
-                # Skip warmup for follow-ups (conversation already exists on Meta)
-                # and for the second call in a bootstrap round (just warmed).
-                needs_warmup=active_resolved.is_new and not bootstrap_already_warmed,
+                # Warmup is only needed when Meta has never seen this
+                # conversation id before. Follow-ups skip it (~halves
+                # latency by dropping two GraphQL round-trips).
+                needs_warmup=active_resolved.is_new,
             )
-            return attempt_request, bootstrap_text
 
-        provider_request, bootstrap_response_text = await _prepare_attempt(resolved)
+        provider_request = _build_request(resolved)
 
         async def _recover_stuck_conversation():
             """Drop the stuck mapping and resolve a fresh meta conversation.
 
             Called when Meta returns an empty stream for an existing
             conversation — the symptom of the conversation being broken on
-            Meta's backend after a previous mid-response stall. Returns a
-            ``(new_resolved, new_request, new_bootstrap_text)`` tuple, or
-            ``None`` when recovery isn't applicable (brand-new conversation
-            that just failed, or no mapping to purge).
-
-            The fresh resolved conversation always lands on the HOME
-            template, so ``_prepare_attempt`` will run a bootstrap call
-            whose text must be propagated to the response — discarding it
-            silently breaks ``include_bootstrap_response`` for clients that
-            rely on it.
+            Meta's backend after a previous mid-response stall. Returns the
+            new ``(resolved, request)`` pair, or ``None`` when recovery isn't
+            applicable (brand-new conversation that just failed, or no mapping
+            to purge).
             """
             if resolved.is_new:
                 return None
@@ -523,8 +541,7 @@ def create_app(
                 client_conversation_id=sticky_id,
                 force_single_conversation=settings.force_single_conversation,
             )
-            new_request, new_bootstrap_text = await _prepare_attempt(new_resolved)
-            return new_resolved, new_request, new_bootstrap_text
+            return new_resolved, _build_request(new_resolved)
 
         if body.stream:
             response_id = f"chatcmpl-{uuid.uuid4()}"
@@ -534,15 +551,8 @@ def create_app(
                 recovery = await _recover_stuck_conversation()
                 if recovery is None:
                     return None
-                _new_resolved, new_request, new_bootstrap_text = recovery
-                # Returning a tuple ``(chunk_iter, bootstrap_text)`` lets
-                # ``_stream_chat_completion`` re-inject the recovered
-                # bootstrap text into the next content chunk; the original
-                # role chunk was emitted before recovery and can't carry it.
-                return (
-                    provider_stream_fn(new_request, state_path=state_path),
-                    new_bootstrap_text,
-                )
+                _new_resolved, new_request = recovery
+                return provider_stream_fn(new_request, state_path=state_path)
 
             response = StreamingResponse(
                 _stream_chat_completion(
@@ -552,7 +562,6 @@ def create_app(
                     conversation_id=resolved.client_conversation_id,
                     chunk_size=settings.stream_chunk_size,
                     logger=logger,
-                    bootstrap_response=bootstrap_response_text,
                     retry_factory=retry_factory,
                 ),
                 media_type="text/event-stream",
@@ -573,14 +582,16 @@ def create_app(
         except ProviderEmptyResponseError as exc:
             recovery = await _recover_stuck_conversation()
             if recovery is None:
+                # Brand-new conversation that already failed — retrying
+                # with a different conversation id won't help. Surface as
+                # 503 ``stuck_conversation`` via the registered exception
+                # handler so the client knows to back off / call /v1/reset.
                 raise
             logger.warning("non_streaming_empty_response_retry: %s", exc)
-            _new_resolved, new_request, new_bootstrap_text = recovery
-            # Adopt the recovery's bootstrap text so ``include_bootstrap_response``
-            # surfaces the freshly bootstrapped greeting instead of the stale
-            # ``None`` from the stuck-conversation attempt that didn't bootstrap.
-            if new_bootstrap_text is not None:
-                bootstrap_response_text = new_bootstrap_text
+            _new_resolved, new_request = recovery
+            # One retry only. If the fresh conversation *also* yields an
+            # empty response, the next ProviderEmptyResponseError escapes
+            # to the registered handler → 503 ``stuck_conversation``.
             provider_response = await provider_generate_fn(
                 new_request, state_path=state_path
             )
@@ -590,7 +601,6 @@ def create_app(
                 content=_clean_assistant_text(provider_response.text),
                 model=settings.model_name,
                 conversation_id=resolved.client_conversation_id,
-                bootstrap_response=bootstrap_response_text,
             )
         )
         response.set_cookie(
